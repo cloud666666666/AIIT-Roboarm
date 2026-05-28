@@ -32,3 +32,6 @@ object_detect/data.yaml
 *.mp4
 *.wav
 *.zip
+
+outputs/
+lerobot
