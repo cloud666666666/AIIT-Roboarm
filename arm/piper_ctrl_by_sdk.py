@@ -109,7 +109,6 @@ class PiperBySDK(Arm):
     ) -> tuple[Union[List[float], None], Union[float, None]]:
         return self.get_arm_angles(retry_times=retry_times)
 
-    # TODO: 如果直接移动太快，参考 LeroboArm 做线性插值
     def set_arm_angles(
         self,
         angles_deg: Sequence[float | int] | None = None,
@@ -119,38 +118,93 @@ class PiperBySDK(Arm):
         if gripper_open_0to1 is not None:
             if not 0 <= gripper_open_0to1 <= 1:
                 raise ValueError("gripper_open_0to1 must in [0, 1]")
+            desired_gripper_0to1 = float(gripper_open_0to1)
+        else:
+            desired_gripper_0to1 = None
+
+        if angles_deg is not None and len(angles_deg) != self.JOINT_COUNT:
+            print(f"关节角度数量错误，期望{self.JOINT_COUNT}个，实际{len(angles_deg)}个")
+            return False
+
+        if angles_deg is None and desired_gripper_0to1 is None:
+            return True
+
+        def send_gripper(open_0to1: float) -> None:
             self.piper.GripperCtrl(
-                int(gripper_open_0to1 * self.MAX_GRIPPER_ANGLE_DEG * self.FACTOR),
+                int(open_0to1 * self.MAX_GRIPPER_ANGLE_DEG * self.FACTOR),
                 gripper_effort=2000 if self.debug_mode else 5000,
                 gripper_code=0x03,
                 set_zero=0,
             )
 
+        def emit_step(
+            joint_angles_deg: Sequence[float],
+            gripper_0to1: float,
+            final_joint_angles_deg: Sequence[float],
+            final_gripper_0to1: float,
+            step_index: int,
+            steps: int,
+            alpha: float,
+        ) -> None:
+            if step_callback is None:
+                return
+            joint_angles = [float(angle) for angle in joint_angles_deg]
+            gripper_deg = float(gripper_0to1 * self.MAX_GRIPPER_ANGLE_DEG)
+            sent_action = {
+                f"joint_{index + 1}.pos": angle
+                for index, angle in enumerate(joint_angles)
+            }
+            sent_action["gripper.pos"] = gripper_deg
+            step_callback(
+                {
+                    "target_joint_angles_deg": joint_angles,
+                    "target_gripper_open_0to1": float(gripper_0to1),
+                    "final_target_joint_angles_deg": [
+                        float(angle) for angle in final_joint_angles_deg
+                    ],
+                    "final_target_gripper_open_0to1": float(final_gripper_0to1),
+                    "sent_action": sent_action,
+                    "step_index": int(step_index),
+                    "steps": int(steps),
+                    "alpha": float(alpha),
+                }
+            )
+
+        was_end_pose = False
         if angles_deg is not None:
-            if len(angles_deg) != self.JOINT_COUNT:
-                print(
-                    f"关节角度数量错误，期望{self.JOINT_COUNT}个，实际{len(angles_deg)}个"
-                )
-                return False
             was_end_pose = self.move_mode_end_pose
             if was_end_pose:
                 self.set_move_mode(move_mode_end_pose=False)
                 self.move_mode_end_pose = False
 
-            start = time.time()
-            current_angles_deg, current_gripper_0to1 = self.get_arm_angles()
-            if current_angles_deg is None or current_gripper_0to1 is None:
-                return False
-            desired_joint_angles = list(angles_deg)
-            for step_index, alpha in enumerate(np.linspace(0, 1, self.steps + 1)[1:]):
-                interp_joint_angles = []
-                for current_angle, desired_angle in zip(
-                    current_angles_deg, desired_joint_angles, strict=True
-                ):
-                    interp_joint_angles.append(
-                        current_angle * (1 - alpha) + desired_angle * alpha
-                    )
+        current_angles_deg, current_gripper_0to1 = self.get_arm_angles()
+        if current_angles_deg is None or current_gripper_0to1 is None:
+            return False
 
+        desired_joint_angles = (
+            list(current_angles_deg) if angles_deg is None else [float(angle) for angle in angles_deg]
+        )
+        final_gripper_0to1 = (
+            float(current_gripper_0to1)
+            if desired_gripper_0to1 is None
+            else desired_gripper_0to1
+        )
+
+        start = time.time()
+        for step_index, alpha in enumerate(np.linspace(0, 1, self.steps + 1)[1:]):
+            interp_joint_angles = []
+            for current_angle, desired_angle in zip(
+                current_angles_deg, desired_joint_angles, strict=True
+            ):
+                interp_joint_angles.append(
+                    current_angle * (1 - alpha) + desired_angle * alpha
+                )
+            interp_gripper_0to1 = (
+                float(current_gripper_0to1) * (1 - alpha)
+                + final_gripper_0to1 * alpha
+            )
+
+            if angles_deg is not None:
                 ctrl = np.array(interp_joint_angles) * self.FACTOR
                 self.piper.JointCtrl(
                     joint_1=int(ctrl[0]),
@@ -160,48 +214,47 @@ class PiperBySDK(Arm):
                     joint_5=int(ctrl[4]),
                     joint_6=int(ctrl[5]),
                 )
+            if desired_gripper_0to1 is not None:
+                send_gripper(interp_gripper_0to1)
 
-                if step_callback is not None:
-                    step_callback(
-                        {
-                            "target_joint_angles_deg": (
-                                [float(angle) for angle in angles_deg]
-                            ),
-                            "target_gripper_open_0to1": (
-                                None
-                                if gripper_open_0to1 is None
-                                else float(gripper_open_0to1)
-                            ),
-                            "final_target_joint_angles_deg": list(desired_joint_angles),
-                            "step_index": int(step_index),
-                            "steps": int(self.steps),
-                            "alpha": float(alpha),
-                        }
-                    )
+            time.sleep(0.01)
+            emit_step(
+                interp_joint_angles,
+                interp_gripper_0to1,
+                desired_joint_angles,
+                final_gripper_0to1,
+                step_index,
+                self.steps,
+                alpha,
+            )
+
+        if angles_deg is not None:
             while True:
-                # 这里获取有问题，有时候没到目标status.motion_status就为0了
-                # 所以感觉没啥用，还是得靠sleep固定时长等待到达
                 status = self.piper.GetArmStatus().arm_status
                 if status.arm_status != 0x0:
                     print(self.arm_status2str(status.arm_status))
-                    # self.piper.JointConfig(clear_err=0xAE)
                     return False
                 if status.motion_status == 0x00:
                     break
                 if time.time() - start > self.timeout:
-                    print("set_arm_angles 超时")
+                    cur, _ = self.get_arm_angles()
+                    if cur is not None:
+                        mse = np.mean((np.array(cur) - np.array(desired_joint_angles)) ** 2)
+                        if mse > self.reach_mse_threshold:
+                            print(f"set_arm_angles 超时 (MSE={mse:.2f})")
                     break
+                time.sleep(0.02)
 
             if was_end_pose:
                 self.set_move_mode(move_mode_end_pose=True)
                 self.move_mode_end_pose = True
 
-        if angles_deg is not None:
             try:
-                self.wait_until_reached(angles_deg)
+                self.wait_until_reached(desired_joint_angles)
             except TimeoutError as e:
                 print(f"仿真机械臂未在超时内到达目标位姿: {e}")
                 return False
+
         return True
 
     def get_arm_angles(

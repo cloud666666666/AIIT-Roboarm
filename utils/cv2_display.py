@@ -18,7 +18,7 @@ _HEADLESS_SERVER_HOST = "0.0.0.0"
 _HEADLESS_SERVER_PORT = get_config_value(
     "cv2_headless_port", None, raise_if_missing=False
 )
-_HEADLESS_JPEG_QUALITY = 90
+_HEADLESS_JPEG_QUALITY = 50
 _HEADLESS_LATEST_FRAMES: dict[str, bytes] = {}
 _HEADLESS_FRAME_EVENTS: dict[str, threading.Event] = {}
 _HEADLESS_KEY_QUEUE: "queue.Queue[int]" = queue.Queue()
@@ -184,6 +184,7 @@ def set_mouse_callback(
         return
     if window_name not in _WINDOW_READY:
         cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.waitKey(1)
         _WINDOW_READY.add(window_name)
     cv2.setMouseCallback(window_name, callback, param)
 

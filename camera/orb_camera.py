@@ -66,7 +66,7 @@ def _process_depth(frame):
 
 
 def get_frames(pipeline: Pipeline) -> dict:
-    frames: FrameSet = pipeline.wait_for_frames(100)
+    frames: FrameSet = pipeline.wait_for_frames(1000)
     if frames is None:
         return {"color": None, "depth": None}
     processed_frames = {
