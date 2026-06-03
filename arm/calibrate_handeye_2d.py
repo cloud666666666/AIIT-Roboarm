@@ -513,7 +513,7 @@ def main():
     argparser.add_argument(
         "--mode",
         type=str,
-        default="calibrate",
+        default="test",
         help="模式: calibrate 手动采集多点; calibrate_board 半自动采集多点; test 测试",
     )
     argparser.add_argument(

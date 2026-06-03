@@ -6,6 +6,7 @@ YOLO 自动抓取 + LeRobot record 数据采集（Piper 版）。
 """
 
 import os
+import shutil
 import sys
 import time
 import select
@@ -51,8 +52,8 @@ RESET_TIME_S = 6000
 VIDEO_CODEC = "h264"
 ROBOT_TYPE = "piper_follower"
 ROBOT_ID = "piper"
-RESUME = True
-TARGET_CLASS = "carrot"  # potato,carrot,tomato
+RESUME = False
+TARGET_CLASS = "potato"  # potato,carrot,tomato
 TASK = f"pick the {TARGET_CLASS} and place into box"
 MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
 MOTOR_FEATURE_NAMES = [f"{motor}.pos" for motor in MOTOR_NAMES]
@@ -127,6 +128,8 @@ class RecordCameras:
         if self.detection_camera_name is not None:
             self._frame_interval = 1.0 / camera_config[self.detection_camera_name].fps
         self._last_capture_t = 0.0
+        self._frame_seq: int = 0  # monotonic counter, bumped each capture
+        self._last_frame_fingerprint: bytes | None = None  # for content dedup
 
     def connect(self):
         for camera in self.cameras.values():
@@ -154,6 +157,14 @@ class RecordCameras:
             frame_bgr = None
             frame_rgb = None
             if camera_frame is not None and self.detection_camera_name is not None:
+                # — content dedup: skip if the camera returned the same image —
+                fingerprint = camera_frame[::8, ::8, :].tobytes()
+                if fingerprint == self._last_frame_fingerprint:
+                    dt_s = time.perf_counter() - loop_start_t
+                    precise_sleep(max(self._frame_interval - dt_s, 0.0))
+                    continue
+                self._last_frame_fingerprint = fingerprint
+
                 frame_bgr = camera_frame
                 config = camera_config[self.detection_camera_name]
                 record_frame = camera_frame
@@ -167,6 +178,7 @@ class RecordCameras:
                     self.last_record_frames[self.detection_camera_name] = (
                         None if frame_rgb is None else frame_rgb.copy()
                     )
+                self._frame_seq += 1
 
             dt_s = time.perf_counter() - loop_start_t
             if capture_interval_s > self._frame_interval * 1.5:
@@ -176,10 +188,17 @@ class RecordCameras:
                 )
             precise_sleep(max(self._frame_interval - dt_s, 0.0))
 
-    def get_frames(self) -> dict[str, np.ndarray | None]:
-        frames = {}
-        if self.detection_camera_name is not None:
-            with self._lock:
+    def get_frames(
+        self, last_seq: int = -1
+    ) -> tuple[dict[str, np.ndarray | None], int]:
+        """Return (frames, seq).  If *last_seq* is given and no new frame has
+        arrived since, returns ({}, last_seq) — the caller should skip/retry."""
+        with self._lock:
+            current_seq = self._frame_seq
+            if last_seq >= 0 and current_seq <= last_seq:
+                return {}, last_seq
+            frames: dict[str, np.ndarray | None] = {}
+            if self.detection_camera_name is not None:
                 frame = self.last_record_frames.get(self.detection_camera_name)
                 frames[self.detection_camera_name] = None if frame is None else frame.copy()
         for name, camera in self.cameras.items():
@@ -187,7 +206,7 @@ class RecordCameras:
                 frames[name] = camera.async_read()
             except TimeoutError:
                 frames[name] = None
-        return frames
+        return frames, current_seq
 
     def get_detection_frame(self) -> np.ndarray | None:
         with self._lock:
@@ -221,6 +240,7 @@ class RecordingArm(PiperBySDK):
         self._action_lock = threading.Lock()
         self._record_stop_event = threading.Event()
         self._record_thread: threading.Thread | None = None
+        self._save_thread: threading.Thread | None = None
 
     def start_recording(self):
         state = self._get_record_state()
@@ -243,6 +263,72 @@ class RecordingArm(PiperBySDK):
             self._record_thread.join(timeout=2.0)
             self._record_thread = None
 
+    def save_episode_async(self) -> bool:
+        """Swap buffer and start background save of the just-recorded episode.
+
+        Must be called after stop_recording(). Extracts the current episode
+        buffer, immediately creates a fresh empty buffer for the next episode,
+        then kicks off a background thread to save the old one.
+
+        Returns True if a save was started (buffer had frames), False if empty.
+        """
+        self._wait_save()
+
+        self.dataset._wait_image_writer()
+
+        old_buffer = self.dataset.episode_buffer
+        if not isinstance(old_buffer, dict) or old_buffer.get("size", 0) == 0:
+            self.dataset.clear_episode_buffer()
+            return False
+
+        # Capture the PNG directory index *before* save_episode overwrites it.
+        # save_episode() internally sets episode_index from self.meta.total_episodes,
+        # which matches the value create_episode_buffer() used when this episode
+        # started recording — so the original int is the correct PNG directory.
+        episode_index: int = old_buffer.get("episode_index")  # type: ignore[assignment]
+
+        # Create a fresh buffer for the next recording *now*.
+        # CRITICAL: override episode_index to a collision-free pending value.
+        # The background save is still reading PNGs from episode_{episode_index}/,
+        # so the new recording must write PNGs to a different directory.
+        # The real episode_index will be set by save_episode() later.
+        self.dataset.episode_buffer = self.dataset.create_episode_buffer()
+        self.dataset.episode_buffer["episode_index"] = (
+            self.dataset.meta.total_episodes + 1
+        )
+
+        self._save_thread = threading.Thread(
+            target=self._save_episode_bg,
+            args=(old_buffer, episode_index),
+            name="lerobot-save-episode",
+            daemon=True,
+        )
+        self._save_thread.start()
+        return True
+
+    def _save_episode_bg(self, episode_data: dict, episode_index: int):
+        """Background episode save — encode video, write parquet, clean up PNGs."""
+        try:
+            self.dataset.save_episode(episode_data=episode_data)
+            # clear_episode_buffer normally deletes temp PNGs, but it's skipped
+            # when episode_data is passed — clean up manually here.
+            for cam_key in self.dataset.meta.camera_keys:
+                img_dir = self.dataset._get_image_file_dir(episode_index, cam_key)
+                if img_dir.is_dir():
+                    shutil.rmtree(img_dir)
+        except Exception as exc:
+            print(f"Background save failed for episode {episode_index}: {exc}")
+
+    def _wait_save(self):
+        """Wait for any in-progress background save to complete."""
+        if self._save_thread is not None:
+            self._save_thread.join()
+            self._save_thread = None
+
+    def wait_save_complete(self):
+        """Public: block until the current background save finishes."""
+        self._wait_save()
+
     def _get_record_state(self) -> np.ndarray | None:
         angles, gripper = self.get_arm_angles(retry_times=0)
         if angles is None or gripper is None:
@@ -262,6 +348,7 @@ class RecordingArm(PiperBySDK):
 
     def _record_loop(self):
         next_t = time.perf_counter()
+        last_frame_seq = -1
         while not self._record_stop_event.is_set():
             loop_start_t = time.perf_counter()
             action_values = self._get_last_action()
@@ -270,8 +357,12 @@ class RecordingArm(PiperBySDK):
                 if action_values is None:
                     action_values = state.tolist()
                     self._set_last_action(action_values)
-                camera_frames = self.cameras.get_frames()
-                if all(image is not None for image in camera_frames.values()):
+                camera_frames, last_frame_seq = self.cameras.get_frames(
+                    last_seq=last_frame_seq
+                )
+                if camera_frames and all(
+                    image is not None for image in camera_frames.values()
+                ):
                     frame = {
                         "observation.state": state,
                         "action": np.array(action_values, dtype=np.float32),
@@ -510,6 +601,12 @@ class TerminalKeyPoller:
         tty.setcbreak(self.fd)
 
     def poll(self, events: dict):
+        """Key mapping (matches lerobot-record's pynput behavior):
+
+           右箭头 / n  → exit_early (immediately ends current loop)
+           左箭头 / r  → rerecord_episode + exit_early (ends loop, discards episode)
+           Esc / q     → stop_recording + exit_early (ends loop, stops entire recording)
+        """
         while select.select([sys.stdin], [], [], 0)[0]:
             ch = sys.stdin.read(1)
             if ch == "\x1b":
@@ -518,20 +615,25 @@ class TerminalKeyPoller:
                     seq = sys.stdin.read(1)
                     if seq == "[" and select.select([sys.stdin], [], [], 0.05)[0]:
                         code = sys.stdin.read(1)
-                        if code == "C":  # right arrow
+                        if code == "C":  # right arrow → next episode
                             events["exit_early"] = True
-                        elif code == "D":  # left arrow
+                        elif code == "D":  # left arrow → rerecord + exit loop
                             events["rerecord_episode"] = True
+                            events["exit_early"] = True
                     else:
                         events["stop_recording"] = True
-                else:  # bare Esc
+                        events["exit_early"] = True
+                else:  # bare Esc → stop + exit loop
                     events["stop_recording"] = True
+                    events["exit_early"] = True
             elif ch == "n":  # next episode (same as right arrow)
                 events["exit_early"] = True
             elif ch == "r":  # rerecord (same as left arrow)
                 events["rerecord_episode"] = True
-            elif ch == "q":
+                events["exit_early"] = True
+            elif ch == "q":  # stop (same as Esc)
                 events["stop_recording"] = True
+                events["exit_early"] = True
 
     def stop(self):
         termios.tcsetattr(self.fd, termios.TCSADRAIN, self.old_settings)
@@ -589,7 +691,6 @@ def main():
                     events["exit_early"] = False
                     break
 
-                camera_frames = cameras.get_frames()
                 display_frame = cameras.get_detection_frame()
                 if display_frame is None:
                     precise_sleep(1 / FPS)
@@ -653,6 +754,22 @@ def main():
 
             arm.stop_recording()
 
+            # — rerecord check from the recording phase (before starting async save) —
+            if events["rerecord_episode"]:
+                print("Re-record episode")
+                events["rerecord_episode"] = False
+                events["exit_early"] = False
+                arm.wait_save_complete()
+                dataset.clear_episode_buffer()
+                continue
+
+            # Start async save *before* reset — save runs in background
+            # while the operator resets the environment
+            episode_saved = arm.save_episode_async()
+            if episode_saved:
+                episode_count += 1
+                print(f"Episode {episode_count} saving in background")
+
             if not events["stop_recording"] and (
                 (episode_count < NUM_EPISODES - 1) or events["rerecord_episode"]
             ):
@@ -663,6 +780,8 @@ def main():
                     key_poller.poll(events)
                     if events["exit_early"] or events["stop_recording"]:
                         events["exit_early"] = False
+                        break
+                    if events["rerecord_episode"]:
                         break
 
                     cameras.get_frames()
@@ -683,28 +802,27 @@ def main():
                     dt_s = time.perf_counter() - loop_start_t
                     precise_sleep(max(1 / FPS - dt_s, 0.0))
 
-            if events["rerecord_episode"]:
-                print("Re-record episode")
-                events["rerecord_episode"] = False
-                events["exit_early"] = False
-                dataset.clear_episode_buffer()
-                continue
-
-            if dataset.episode_buffer["size"] > 0:
-                dataset.save_episode()
-                episode_count += 1
-                print(f"Episode {episode_count} saved")
-            else:
-                dataset.clear_episode_buffer()
+                # — rerecord check from the reset phase —
+                if events["rerecord_episode"]:
+                    print(f"Re-record episode (discarding episode {episode_count})")
+                    events["rerecord_episode"] = False
+                    events["exit_early"] = False
+                    arm.wait_save_complete()
+                    dataset.clear_episode_buffer()
+                    if episode_saved:
+                        episode_count -= 1
+                    continue
 
     except KeyboardInterrupt:
         pass
     finally:
         key_poller.stop()
         arm.stop_recording()
+        arm.wait_save_complete()
         if dataset.episode_buffer["size"] > 0:
             dataset.save_episode()
-            print(f"Episode saved (interrupted)")
+            episode_count += 1
+            print(f"Episode {episode_count} saved (interrupted)")
         dataset.finalize()
         arm.move_to_home(gripper_open_0to1=0.8)
         arm.disconnect_arm()
