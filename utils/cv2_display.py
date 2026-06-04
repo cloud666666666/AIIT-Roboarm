@@ -2,6 +2,7 @@ import atexit
 import os
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Any
 
@@ -19,6 +20,7 @@ _HEADLESS_SERVER_PORT = get_config_value(
     "cv2_headless_port", None, raise_if_missing=False
 )
 _HEADLESS_JPEG_QUALITY = 50
+_HEADLESS_OUTPUT_FPS = 30  # cap frames sent to browser to avoid TCP buffer buildup
 _HEADLESS_LATEST_FRAMES: dict[str, bytes] = {}
 _HEADLESS_FRAME_EVENTS: dict[str, threading.Event] = {}
 _HEADLESS_KEY_QUEUE: "queue.Queue[int]" = queue.Queue()
@@ -58,15 +60,26 @@ def _run_headless_server() -> None:
 
         def generate():
             last_frame = None
+            last_send_time = 0.0
+            min_interval = 1.0 / _HEADLESS_OUTPUT_FPS
             while True:
-                if event.wait(timeout=30):
-                    event.clear()
+                # Wait for a new frame, but poll at output rate so we
+                # naturally drop bursts when producer is faster than browser.
+                event.wait(timeout=min_interval)
+                event.clear()
+                # Always grab the *latest* frame — discard any backlog.
                 frame = _HEADLESS_LATEST_FRAMES.get(window_name)
                 if frame is None:
                     continue
                 if frame == last_frame:
                     continue
+                # Rate-limit output: if we just sent a frame, hold the
+                # interval so the browser never queues up a backlog.
+                now = time.perf_counter()
+                if now - last_send_time < min_interval:
+                    continue
                 last_frame = frame
+                last_send_time = now
                 yield (
                     b"--frame\r\n" b"Content-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
                 )
