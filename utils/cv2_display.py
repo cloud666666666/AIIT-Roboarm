@@ -62,11 +62,18 @@ def _run_headless_server() -> None:
             last_frame = None
             last_send_time = 0.0
             min_interval = 1.0 / _HEADLESS_OUTPUT_FPS
+            first_pass = True
             while True:
-                # Wait for a new frame, but poll at output rate so we
-                # naturally drop bursts when producer is faster than browser.
-                event.wait(timeout=min_interval)
-                event.clear()
+                if first_pass:
+                    # On first iteration, send whatever frame we have
+                    # immediately so the browser doesn't spin waiting for
+                    # the first multipart chunk.
+                    first_pass = False
+                else:
+                    # Wait for a new frame, but poll at output rate so we
+                    # naturally drop bursts when producer is faster than browser.
+                    event.wait(timeout=min_interval)
+                    event.clear()
                 # Always grab the *latest* frame — discard any backlog.
                 frame = _HEADLESS_LATEST_FRAMES.get(window_name)
                 if frame is None:
@@ -119,13 +126,32 @@ def _run_headless_server() -> None:
             return {"ok": False}, 500
         return {"ok": True, "dispatched": True}
 
-    app.run(
-        host=_HEADLESS_SERVER_HOST,
-        port=_HEADLESS_SERVER_PORT,
-        threaded=True,
-        debug=False,
-        use_reloader=False,
-    )
+    try:
+        app.run(
+            host=_HEADLESS_SERVER_HOST,
+            port=_HEADLESS_SERVER_PORT,
+            threaded=True,
+            debug=False,
+            use_reloader=False,
+        )
+    except Exception as exc:
+        print(f"[cv2_display] Flask server crashed: {exc}")
+
+
+def _wait_for_flask_ready(timeout: float = 15.0) -> bool:
+    """Poll until the Flask server is actually listening on the port."""
+    import socket
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        try:
+            sock = socket.create_connection(
+                (_HEADLESS_SERVER_HOST, _HEADLESS_SERVER_PORT), timeout=0.3
+            )
+            sock.close()
+            return True
+        except (ConnectionRefusedError, OSError):
+            time.sleep(0.1)
+    return False
 
 
 def _ensure_headless_server() -> None:
@@ -137,11 +163,18 @@ def _ensure_headless_server() -> None:
             return
         thread = threading.Thread(target=_run_headless_server, daemon=True)
         thread.start()
+        ready = _wait_for_flask_ready()
         _HEADLESS_SERVER_STARTED = True
-        print(
-            f"Headless OpenCV stream ready at http://{_HEADLESS_SERVER_HOST}:{_HEADLESS_SERVER_PORT}/ "
-            f"(append ?window=<window_name>)"
-        )
+        if ready:
+            print(
+                f"Headless OpenCV stream ready at http://{_HEADLESS_SERVER_HOST}:{_HEADLESS_SERVER_PORT}/ "
+                f"(append ?window=<window_name>)"
+            )
+        else:
+            print(
+                f"Headless OpenCV server started but port {_HEADLESS_SERVER_PORT} "
+                f"not reachable after timeout — continuing anyway"
+            )
 
 
 def _encode_headless_frame(image: Any) -> bytes | None:
