@@ -34,4 +34,3 @@ object_detect/data.yaml
 *.zip
 
 outputs/
-lerobot

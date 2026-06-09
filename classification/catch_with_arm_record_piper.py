@@ -13,6 +13,7 @@ import select
 import tty
 import termios
 import threading
+import traceback
 from math import inf
 from pathlib import Path
 
@@ -34,6 +35,7 @@ from camera.camera_api import Camera
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
+from lerobot.datasets.utils import write_stats
 from lerobot.utils.robot_utils import precise_sleep
 from object_detect.detect import detect_objects_in_frame, draw_box, load_model
 from utils.config_getter import get_config_value
@@ -53,7 +55,8 @@ VIDEO_CODEC = "h264"
 ROBOT_TYPE = "piper_follower"
 ROBOT_ID = "piper"
 RESUME = True
-TARGET_CLASS = "potato"  # potato,carrot,tomato
+TARGET_CLASS_LIST = ["potato", "carrot", "tomato"]
+TARGET_CLASS = TARGET_CLASS_LIST[0]
 TASK = f"pick the {TARGET_CLASS} toy and place into box"
 MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]
 MOTOR_FEATURE_NAMES = [f"{motor}.pos" for motor in MOTOR_NAMES]
@@ -62,6 +65,12 @@ MAX_GRIPPER_ANGLE_DEG = 100.0
 camera_config: dict[str, OpenCVCameraConfig] = {
     "above": OpenCVCameraConfig(
         index_or_path=int(os.environ.get("LEROBOT_ABOVE_CAMERA", 4)),
+        width=640,
+        height=480,
+        fps=FPS,
+    ),
+    "wrist": OpenCVCameraConfig(
+        index_or_path=int(os.environ.get("LEROBOT_WRIST_CAMERA", 4)),
         width=640,
         height=480,
         fps=FPS,
@@ -102,6 +111,56 @@ def get_features() -> dict:
             "names": ["height", "width", "channels"],
         }
     return features
+
+
+def _stats_value_is_json_none(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, np.ndarray) and value.ndim == 0 and value.dtype == object:
+        return value.item() is None
+    return False
+
+
+def _normalize_stats_for_append(stats: dict | None) -> tuple[dict | None, bool]:
+    """Make loaded stats acceptable to LeRobot's append-time validator."""
+    if stats is None:
+        return None, False
+
+    normalized: dict = {}
+    changed = False
+    for feature_key, feature_stats in stats.items():
+        if not isinstance(feature_stats, dict):
+            changed = True
+            continue
+
+        normalized_feature: dict = {}
+        drop_feature = False
+        for stat_key, stat_value in feature_stats.items():
+            if _stats_value_is_json_none(stat_value):
+                drop_feature = True
+                changed = True
+                break
+
+            array_value = np.asarray(stat_value)
+            if array_value.ndim == 0:
+                array_value = array_value.reshape(1)
+                changed = True
+            normalized_feature[stat_key] = array_value
+
+        if drop_feature or not normalized_feature:
+            continue
+        normalized[feature_key] = normalized_feature
+
+    return normalized, changed
+
+
+def _normalize_dataset_stats(dataset: LeRobotDataset) -> None:
+    stats, changed = _normalize_stats_for_append(dataset.meta.stats)
+    if changed:
+        dataset.meta.stats = stats
+        write_stats(stats, dataset.root)
+        print("Resume: normalized stats.json for append")
+
 
 
 class RecordCameras:
@@ -241,6 +300,7 @@ class RecordingArm(PiperBySDK):
         self._record_stop_event = threading.Event()
         self._record_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
+        self._save_error: Exception | None = None
 
     def start_recording(self):
         state = self._get_record_state()
@@ -273,6 +333,7 @@ class RecordingArm(PiperBySDK):
         Returns True if a save was started (buffer had frames), False if empty.
         """
         self._wait_save()
+        self._save_error = None
 
         self.dataset._wait_image_writer()
 
@@ -309,6 +370,7 @@ class RecordingArm(PiperBySDK):
     def _save_episode_bg(self, episode_data: dict, episode_index: int):
         """Background episode save — encode video, write parquet, clean up PNGs."""
         try:
+            _normalize_dataset_stats(self.dataset)
             self.dataset.save_episode(episode_data=episode_data)
             # clear_episode_buffer normally deletes temp PNGs, but it's skipped
             # when episode_data is passed — clean up manually here.
@@ -317,13 +379,17 @@ class RecordingArm(PiperBySDK):
                 if img_dir.is_dir():
                     shutil.rmtree(img_dir)
         except Exception as exc:
+            self._save_error = exc
             print(f"Background save failed for episode {episode_index}: {exc}")
+            traceback.print_exc()
 
     def _wait_save(self):
         """Wait for any in-progress background save to complete."""
         if self._save_thread is not None:
             self._save_thread.join()
             self._save_thread = None
+            if self._save_error is not None:
+                raise RuntimeError("Background episode save failed") from self._save_error
 
     def wait_save_complete(self):
         """Public: block until the current background save finishes."""
@@ -543,6 +609,7 @@ def create_or_resume_dataset() -> LeRobotDataset:
             batch_encoding_size=1,
             vcodec=VIDEO_CODEC,
         )
+        _normalize_dataset_stats(dataset)
         if dataset.fps != FPS:
             raise ValueError(f"Dataset fps mismatch: expected {FPS}, got {dataset.fps}")
         if dataset.meta.robot_type != ROBOT_TYPE:
@@ -570,6 +637,46 @@ def create_or_resume_dataset() -> LeRobotDataset:
                     f"Dataset feature names mismatch for {key}: "
                     f"expected {expected['names']}, got {actual.get('names')}"
                 )
+        # —— Fix: prevent RESUME from overwriting existing data files ——
+        # After finalize(), the ParquetWriter is closed. On next RESUME,
+        # _save_episode_data's first branch jumps to the "next" file index
+        # via update_chunk_file_indices(). If that index already exists on
+        # disk (e.g. from an earlier recording session), pq.ParquetWriter
+        # will silently truncate it — permanent data loss.
+        #
+        # Fix: scan existing data files, and if the last episode's
+        # data/file_index is not the max on disk, update the on-disk
+        # metadata so the RESUME jump always lands on a fresh index.
+        import pandas as pd
+        data_chunk_dir = dataset.root / "data" / "chunk-000"
+        existing_files = sorted(data_chunk_dir.glob("file-*.parquet"))
+        if existing_files:
+            max_existing_file_idx = max(
+                int(f.stem.split("-")[1]) for f in existing_files
+            )
+            last_ep_file_idx = int(dataset.meta.episodes[-1]["data/file_index"])
+            if last_ep_file_idx < max_existing_file_idx:
+                # Update the on-disk metadata so the "jump to next file"
+                # starts from the max existing index → lands on max+1 (free).
+                meta_chunk_dir = (
+                    dataset.root / "meta" / "episodes" / "chunk-000"
+                )
+                for meta_f in meta_chunk_dir.glob("file-*.parquet"):
+                    meta_df = pd.read_parquet(meta_f)
+                    if len(meta_df) > 0:
+                        last_row_idx = meta_df["episode_index"].idxmax()
+                        meta_df.loc[last_row_idx, "data/file_index"] = (
+                            max_existing_file_idx
+                        )
+                        meta_df.to_parquet(meta_f, index=False)
+                # Reload metadata so in-memory state matches disk
+                dataset.meta.load_metadata()
+                _normalize_dataset_stats(dataset)
+                print(
+                    f"Resume: adjusted last episode data/file_index "
+                    f"from {last_ep_file_idx} to {max_existing_file_idx}"
+                )
+
         dataset.start_image_writer(
             num_processes=0,
             num_threads=4 * len(camera_config),
@@ -678,7 +785,10 @@ def main():
 
     try:
         while episode_count < NUM_EPISODES and not events["stop_recording"]:
-            print(f"\n=== Recording episode {episode_count} ===")
+            global TARGET_CLASS
+            TARGET_CLASS = TARGET_CLASS_LIST[episode_count % len(TARGET_CLASS_LIST)]
+            arm.task = f"pick the {TARGET_CLASS} toy and place into box"
+            print(f"\n=== Recording episode {episode_count} (target: {TARGET_CLASS}) ===")
             arm.start_recording()
             episode_start_t = time.perf_counter()
             episode_grasped = False
@@ -816,20 +926,38 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        save_error = None
         key_poller.stop()
         arm.stop_recording()
-        arm.wait_save_complete()
+        try:
+            arm.wait_save_complete()
+        except RuntimeError as exc:
+            save_error = exc
         if dataset.episode_buffer["size"] > 0:
-            dataset.save_episode()
-            episode_count += 1
-            print(f"Episode {episode_count} saved (interrupted)")
-        dataset.finalize()
+            try:
+                _normalize_dataset_stats(dataset)
+                dataset.save_episode()
+                episode_count += 1
+                print(f"Episode {episode_count} saved (interrupted)")
+            except Exception as exc:
+                save_error = exc
+                print(f"Interrupted episode save failed: {exc}")
+                traceback.print_exc()
+        try:
+            dataset.finalize()
+        except Exception as exc:
+            if save_error is None:
+                save_error = exc
+            print(f"Dataset finalize failed: {exc}")
+            traceback.print_exc()
         arm.move_to_home(gripper_open_0to1=0.8)
         arm.disconnect_arm()
         cameras.close()
         if HAS_DISPLAY:
             destroy_all_windows()
-        print(f"录制完成，共 {episode_count} 个episode，保存在 {DATASET_ROOT}")
+        if save_error is not None:
+            print(f"录制结束，但后台保存失败: {save_error}")
+        print(f"录制完成，共 {dataset.num_episodes} 个episode，保存在 {DATASET_ROOT}")
 
 
 if __name__ == "__main__":

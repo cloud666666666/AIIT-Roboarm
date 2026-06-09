@@ -31,4 +31,8 @@ dependencies = [
     "websocket>=0.2.1",
     "xlrd2>=1.3.4",
     "xlwt>=1.3.0",
+    "lerobot",
 ]
+
+[tool.uv.sources]
+lerobot = { path = "lerobot" }

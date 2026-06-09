@@ -75,20 +75,17 @@ uv --version   # 应 >= 0.5.0
 
 ```bash
 # 克隆本仓库
-git clone https://github.com/AuYang261/roboarm.git ~/roboarm
+git clone git@github.com:cloud666666666/AIIT-Roboarm.git 
 cd ~/roboarm
 
 # 克隆 LeRobot 依赖（与 roboarm 同级或任意位置）
-git clone https://github.com/huggingface/lerobot.git ~/xxx/lerobot
+git clone https://github.com/huggingface/lerobot.git 
 
 # 创建软链接，让 roboarm 能找到 lerobot 源码
-ln -s ~/xxx/lerobot ~/roboarm/lerobot
+# 将源路径替换为你实际克隆 lerobot 的位置
+ln -s ~/lerobot ~/roboarm/lerobot
 
-# 安装 lerobot 的依赖
-cd ~/xxx/lerobot
-uv pip install -e . --directory ~/roboarm
-
-# 回到 roboarm，同步项目 Python 环境
+# 回到 roboarm，同步 Python 环境（含 lerobot）
 cd ~/roboarm
 uv sync
 

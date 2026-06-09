@@ -36,7 +36,7 @@ import numpy as np
 import yaml
 
 from arm.piper_ctrl_by_sdk import PiperBySDK
-from camera.camera_api import Camera
+from camera import orb_camera  # pyorbbecsdk — required for Orbbec Gemini 336L
 from lerobot.cameras.opencv.camera_opencv import OpenCVCamera
 from lerobot.cameras.opencv.configuration_opencv import OpenCVCameraConfig
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -52,7 +52,7 @@ HAS_DISPLAY = os.environ.get("DISPLAY") is not None or show_img_by_web()
 FPS = 30
 DATASET_REPO_ID = "a/b"
 DATASET_ROOT = "/home/czn/dataset/piper_yolopick"
-NUM_EPISODES = 1000
+NUM_EPISODES = 20
 EPISODE_TIME_S = 6000
 VIDEO_CODEC = "h264"
 ROBOT_TYPE = "piper_follower"
@@ -77,12 +77,26 @@ RESET_MAX_OBJECTS_PER_CYCLE: int | None = None
 AUTO_ADVANCE_DELAY_S = 3.0
 
 camera_config: dict[str, OpenCVCameraConfig] = {
-    "above": OpenCVCameraConfig(
-        index_or_path=int(os.environ.get("LEROBOT_ABOVE_CAMERA", 4)),
+    "orbbec": OpenCVCameraConfig(
+        index_or_path="/dev/video12",
         width=640,
         height=480,
         fps=FPS,
     ),
+    "realsense": OpenCVCameraConfig(
+        index_or_path="/dev/video4",
+        width=1280,
+        height=720,
+        fps=FPS,
+    ),
+}
+
+# Target recording resolution for dataset storage.
+# Cameras may output native resolutions that differ from the stored size;
+# frames are resized to the target before being added to the dataset.
+RECORD_RESOLUTION: dict[str, tuple[int, int]] = {
+    "orbbec": (640, 480),
+    "realsense": (640, 480),
 }
 
 
@@ -170,10 +184,13 @@ def get_features() -> dict:
             "names": MOTOR_FEATURE_NAMES,
         },
     }
-    for cam_name, cam_cfg in camera_config.items():
+    for cam_name in camera_config:
+        rec_w, rec_h = RECORD_RESOLUTION.get(
+            cam_name, (camera_config[cam_name].width, camera_config[cam_name].height)
+        )
         features[f"observation.images.{cam_name}"] = {
             "dtype": "video",
-            "shape": (cam_cfg.height, cam_cfg.width, 3),
+            "shape": (rec_h, rec_w, 3),
             "names": ["height", "width", "channels"],
         }
     return features
@@ -182,18 +199,31 @@ def get_features() -> dict:
 # ===== 相机管理 (from catch_with_arm_record_piper.py) =====
 
 class RecordCameras:
-    """Manages detection camera (orb) + LeRobot recording cameras."""
+    """Manages detection camera (orbbec/above) + LeRobot recording cameras (realsense/wrist).
 
-    def __init__(self, detection_camera_name: str = "above"):
+    The orbbec detection camera uses pyorbbecsdk (via orb_camera.py) because
+    OpenCV's V4L2 backend cannot properly initialise the Orbbec Gemini 336L
+    hardware — without the SDK the camera outputs uninitialised/corrupt frames.
+    """
+
+    def __init__(self, detection_camera_name: str = "orbbec"):
         self.detection_camera_name = (
             detection_camera_name if detection_camera_name in camera_config else None
         )
-        self.detection_camera = (
-            Camera(color=True, depth=False) if self.detection_camera_name else None
+        # Orbbec requires the proprietary SDK; OpenCV V4L2 won't work.
+        self._orb_pipeline = None
+        self._detection_is_orbbec = (self.detection_camera_name == "orbbec")
+        # Use OpenCVCamera for detection only if it's NOT an orbbec camera.
+        self.detection_camera: OpenCVCamera | None = (
+            None if self._detection_is_orbbec
+            else OpenCVCamera(camera_config[self.detection_camera_name])
+            if self.detection_camera_name
+            else None
         )
         self.last_detection_frame_bgr: np.ndarray | None = None
         self.last_record_frames: dict[str, np.ndarray | None] = {}
-        self.cameras = {
+        # Recording cameras: everything EXCEPT the detection camera.
+        self.cameras: dict[str, OpenCVCamera] = {
             name: OpenCVCamera(config)
             for name, config in camera_config.items()
             if name != self.detection_camera_name
@@ -205,17 +235,22 @@ class RecordCameras:
         if self.detection_camera_name is not None:
             self._frame_interval = 1.0 / camera_config[self.detection_camera_name].fps
         self._last_capture_t = 0.0
-        self._frame_seq: int = 0  # monotonic counter, bumped each capture
-        self._last_frame_fingerprint: bytes | None = None  # for content dedup
+        self._frame_seq: int = 0
+        self._last_frame_fingerprint: bytes | None = None
 
     def connect(self):
         for camera in self.cameras.values():
             camera.connect()
-        if self.detection_camera is not None and self._thread is None:
+        if self._detection_is_orbbec:
+            # Orbbec Gemini 336L must be initialised via pyorbbecsdk.
+            self._orb_pipeline = orb_camera.open_camera(color=True, depth=False)
+        elif self.detection_camera is not None:
+            self.detection_camera.connect()
+        if self.detection_camera_name is not None and self._thread is None:
             self._stop_event.clear()
             self._thread = threading.Thread(
                 target=self._capture_detection_camera,
-                name="record-camera-above",
+                name="record-camera-detection",
                 daemon=True,
             )
             self._thread.start()
@@ -225,16 +260,23 @@ class RecordCameras:
             loop_start_t = time.perf_counter()
             capture_interval_s = loop_start_t - self._last_capture_t if self._last_capture_t else 0.0
             self._last_capture_t = loop_start_t
+            camera_frame = None
             try:
-                camera_frame = self.detection_camera.get_frames().get("color")
-            except Exception as exc:
+                if self._detection_is_orbbec and self._orb_pipeline is not None:
+                    # orb_camera returns {"color": bgr, "depth": ...} — already BGR.
+                    camera_frame = orb_camera.get_frames(self._orb_pipeline).get("color")
+                elif self.detection_camera is not None:
+                    # OpenCVCamera has a background read thread; read_latest()
+                    # returns the most recent frame without blocking.
+                    camera_frame = self.detection_camera.read_latest(max_age_ms=500)
+            except (TimeoutError, Exception) as exc:
                 print(f"读取检测相机失败: {exc}")
                 camera_frame = None
 
             frame_bgr = None
             frame_rgb = None
             if camera_frame is not None and self.detection_camera_name is not None:
-                # — content dedup: skip if the camera returned the same image —
+                # Content dedup: skip if the camera returned the same image.
                 fingerprint = camera_frame[::8, ::8, :].tobytes()
                 if fingerprint == self._last_frame_fingerprint:
                     dt_s = time.perf_counter() - loop_start_t
@@ -242,12 +284,20 @@ class RecordCameras:
                     continue
                 self._last_frame_fingerprint = fingerprint
 
-                frame_bgr = camera_frame
-                config = camera_config[self.detection_camera_name]
-                record_frame = camera_frame
-                if record_frame.shape[1] != config.width or record_frame.shape[0] != config.height:
-                    record_frame = cv2.resize(record_frame, (config.width, config.height))
-                frame_rgb = cv2.cvtColor(record_frame, cv2.COLOR_BGR2RGB)
+                if self._detection_is_orbbec:
+                    # orb_camera.get_frames() already returns BGR (via frame_to_bgr_image).
+                    frame_bgr = camera_frame
+                    # Convert BGR → RGB for recording.
+                    record_frame = cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB)
+                else:
+                    # OpenCVCamera outputs RGB by default; convert to BGR for YOLO.
+                    frame_bgr = cv2.cvtColor(camera_frame, cv2.COLOR_RGB2BGR)
+                    record_frame = camera_frame  # already RGB
+
+                rec_w, rec_h = RECORD_RESOLUTION[self.detection_camera_name]
+                if record_frame.shape[1] != rec_w or record_frame.shape[0] != rec_h:
+                    record_frame = cv2.resize(record_frame, (rec_w, rec_h))
+                frame_rgb = record_frame
 
             with self._lock:
                 self.last_detection_frame_bgr = None if frame_bgr is None else frame_bgr.copy()
@@ -280,7 +330,12 @@ class RecordCameras:
                 frames[self.detection_camera_name] = None if frame is None else frame.copy()
         for name, camera in self.cameras.items():
             try:
-                frames[name] = camera.async_read()
+                frame = camera.async_read()
+                if frame is not None and name in RECORD_RESOLUTION:
+                    rec_w, rec_h = RECORD_RESOLUTION[name]
+                    if frame.shape[1] != rec_w or frame.shape[0] != rec_h:
+                        frame = cv2.resize(frame, (rec_w, rec_h))
+                frames[name] = frame
             except TimeoutError:
                 frames[name] = None
         return frames, current_seq
@@ -296,8 +351,11 @@ class RecordCameras:
         if self._thread is not None:
             self._thread.join(timeout=2.0)
             self._thread = None
-        if self.detection_camera is not None:
-            self.detection_camera.close()
+        if self._detection_is_orbbec and self._orb_pipeline is not None:
+            orb_camera.close_camera(self._orb_pipeline)
+            self._orb_pipeline = None
+        elif self.detection_camera is not None and self.detection_camera.is_connected:
+            self.detection_camera.disconnect()
         for camera in self.cameras.values():
             if camera.is_connected:
                 camera.disconnect()
@@ -687,7 +745,7 @@ def create_or_resume_dataset() -> LeRobotDataset:
         # through to HF hub code (get_safe_version → list_repo_refs) which
         # fails for fake repo_ids like "a/b".  Recreate instead.
         meta_episodes = root / "meta" / "episodes"
-        if not meta_episodes.is_dir() or not list(meta_episodes.glob("*.parquet")):
+        if not meta_episodes.is_dir() or not list(meta_episodes.rglob("*.parquet")):
             print(f"Incomplete dataset at {root} (no episode metadata), recreating...")
             shutil.rmtree(root)
             return LeRobotDataset.create(
@@ -702,12 +760,55 @@ def create_or_resume_dataset() -> LeRobotDataset:
                 vcodec=VIDEO_CODEC,
             )
 
-        dataset = LeRobotDataset(
-            DATASET_REPO_ID,
-            root=DATASET_ROOT,
-            batch_encoding_size=1,
-            vcodec=VIDEO_CODEC,
-        )
+        # revision="local" skips the HF Hub get_safe_version() check
+        # (is_valid_version("local") returns False — it's not PEP 440).
+        # Required because DATASET_REPO_ID is fake ("a/b") and the Jetson
+        # may not have internet access to the HF Hub.
+        try:
+            dataset = LeRobotDataset(
+                DATASET_REPO_ID,
+                root=DATASET_ROOT,
+                revision="local",
+                batch_encoding_size=1,
+                vcodec=VIDEO_CODEC,
+            )
+        except Exception as exc:
+            # Corrupted parquet files (e.g. from interrupted writes or power loss)
+            # prevent LeRobotDataset from loading metadata OR episode data.
+            # LeRobotDataset.__init__ first loads meta/episodes/*.parquet, then
+            # loads data/*/*.parquet — either step can fail.  Scan both trees,
+            # remove every corrupted/empty parquet, and retry.
+            print(f"Failed to load dataset: {exc}")
+            import pyarrow.parquet as pq
+            corrupted_files = []
+            for scan_dir in (root / "meta", root / "data"):
+                if not scan_dir.is_dir():
+                    continue
+                for pf in sorted(scan_dir.rglob("*.parquet")):
+                    try:
+                        table = pq.read_table(str(pf))
+                        del table
+                    except Exception:
+                        corrupted_files.append(pf)
+                    else:
+                        if pf.stat().st_size == 0:
+                            corrupted_files.append(pf)
+            if corrupted_files:
+                print(f"Found {len(corrupted_files)} corrupted/empty parquet file(s):")
+                for cf in corrupted_files:
+                    print(f"  Removing: {cf}")
+                    cf.unlink(missing_ok=True)
+            else:
+                print("No corrupted parquet files found — re-raising original error")
+                raise
+            print("Reinitializing dataset with remaining valid episodes...")
+            dataset = LeRobotDataset(
+                DATASET_REPO_ID,
+                root=DATASET_ROOT,
+                revision="local",
+                batch_encoding_size=1,
+                vcodec=VIDEO_CODEC,
+            )
         if dataset.fps != FPS:
             raise ValueError(f"Dataset fps mismatch: expected {FPS}, got {dataset.fps}")
         if dataset.meta.robot_type != ROBOT_TYPE:
@@ -840,47 +941,20 @@ def auto_reset_phase(
             print(f"  No targets found — reset complete ({objects_reset} objects moved)")
             break
 
-        # — positions of every detected object still on the table (avoid collisions) —
-        all_target_positions = [(t[0], t[1]) for t in targets]
-
-        # — pick the first target and generate a validated random place position —
+        # — pick the first target and generate a random place position —
         tx, ty, grad, class_name, u, v, w, h, r, score = targets[0]
 
-        # Generate a random place position that is:
-        #   (a) within workspace bounds, and
-        #   (b) at least RESET_MIN_PLACE_DIST_M away from every object
-        #       currently on the table (YOLO-detected targets include both
-        #       original remaining objects and previously-reset objects).
+        # Each class has its own random_pos region in class_pos config,
+        # so we don't need per-object distance checks — the regions
+        # themselves prevent objects from being placed on top of each other.
         (rx_min, rx_max), (ry_min, ry_max) = get_random_pos_ranges(class_pos, class_name)
-        place_x, place_y = tx, ty
-        for _ in range(50):  # retry loop
-            place_x = random.uniform(rx_min, rx_max)
-            place_y = random.uniform(ry_min, ry_max)
-            if not _pos_in_workspace(place_x, place_y):
-                continue
-            if any(
-                np.hypot(place_x - ox, place_y - oy) < RESET_MIN_PLACE_DIST_M
-                for ox, oy in all_target_positions
-            ):
-                continue
-            break
-        else:
-            # Fallback: offset from the pickup point, avoiding other objects.
-            for angle in [0.0, np.pi / 2, np.pi, -np.pi / 2]:
-                place_x = tx + RESET_MIN_PLACE_DIST_M * np.cos(angle)
-                place_y = ty + RESET_MIN_PLACE_DIST_M * np.sin(angle)
-                if not _pos_in_workspace(place_x, place_y):
-                    continue
-                if any(
-                    np.hypot(place_x - ox, place_y - oy) < RESET_MIN_PLACE_DIST_M
-                    for ox, oy in all_target_positions
-                ):
-                    continue
-                break
-            else:
-                # Last resort: use the original fallback.
-                place_x = tx + RESET_MIN_PLACE_DIST_M
-                place_y = ty
+
+        place_x = random.uniform(rx_min, rx_max)
+        place_y = random.uniform(ry_min, ry_max)
+        if not _pos_in_workspace(place_x, place_y):
+            # Clamp to workspace if the class region exceeds it.
+            place_x = max(WORKSPACE_X_RANGE[0], min(WORKSPACE_X_RANGE[1], place_x))
+            place_y = max(WORKSPACE_Y_RANGE[0], min(WORKSPACE_Y_RANGE[1], place_y))
 
         print(
             f"  Reset [{objects_reset + 1}]: {class_name} "
@@ -989,8 +1063,10 @@ def main():
     print("  s    = skip auto-reset this cycle")
     print("  q/Esc = stop entirely")
 
+    target_episodes = dataset.num_episodes + NUM_EPISODES
+    print(f"  Target:         {target_episodes} episodes total")
     try:
-        while episode_count < NUM_EPISODES and not events["stop_recording"]:
+        while episode_count < target_episodes and not events["stop_recording"]:
             # ================================================================
             #  Phase 1 — Recording
             # ================================================================
@@ -1143,7 +1219,7 @@ def main():
         key_poller.stop()
         arm.stop_recording()
         arm.wait_save_complete()
-        if dataset.episode_buffer["size"] > 0:
+        if dataset.episode_buffer is not None and dataset.episode_buffer["size"] > 0:
             dataset.save_episode()
             episode_count += 1
             print(f"Episode {episode_count} saved (interrupted)")
