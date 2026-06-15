@@ -54,7 +54,7 @@ RESET_TIME_S = 6000
 VIDEO_CODEC = "h264"
 ROBOT_TYPE = "piper_follower"
 ROBOT_ID = "piper"
-RESUME = True
+RESUME = True  # True to resume from existing dataset, False to start fresh (must not exist)
 TARGET_CLASS_LIST = ["potato", "carrot", "tomato"]
 TARGET_CLASS = TARGET_CLASS_LIST[0]
 TASK = f"pick the {TARGET_CLASS} toy and place into box"
@@ -62,15 +62,50 @@ MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6",
 MOTOR_FEATURE_NAMES = [f"{motor}.pos" for motor in MOTOR_NAMES]
 MAX_GRIPPER_ANGLE_DEG = 100.0
 
+def _find_camera_device(keyword: str) -> str:
+    """Find the RGB color stream /dev/video path for a camera by keyword.
+
+    Uses /dev/v4l/by-id/ symlinks which are stable based on USB serial numbers,
+    so the correct camera is always found regardless of USB enumeration order.
+
+    Args:
+        keyword: Substring to match in the by-id symlink name (e.g. 'Orbbec', 'Intel').
+
+    Returns:
+        Stable path like '/dev/v4l/by-id/usb-Orbbec_...-video-index0'.
+
+    Raises:
+        FileNotFoundError: If no matching camera is found.
+    """
+    import glob
+
+    by_id_dir = "/dev/v4l/by-id"
+    pattern = f"{by_id_dir}/*{keyword}*-video-index0"
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(
+            f"找不到匹配 '{keyword}' 的相机设备。"
+            f"请检查 /dev/v4l/by-id/ 目录，或运行 lerobot-find-cameras 确认相机已连接。"
+        )
+    return matches[0]
+
+
+# Stable camera paths via /dev/v4l/by-id/ symlinks.
+# - "above": Orbbec Gemini 336L, RGB color stream (video-index0)
+# - "wrist": Intel RealSense D435I, RGB color stream (video-index0)
+# Override via env vars LEROBOT_ABOVE_CAMERA / LEROBOT_WRIST_CAMERA if needed.
+_above_path = os.environ.get("LEROBOT_ABOVE_CAMERA") or _find_camera_device("Orbbec")
+_wrist_path = os.environ.get("LEROBOT_WRIST_CAMERA") or _find_camera_device("Intel")
+
 camera_config: dict[str, OpenCVCameraConfig] = {
     "above": OpenCVCameraConfig(
-        index_or_path=int(os.environ.get("LEROBOT_ABOVE_CAMERA", 4)),
+        index_or_path=_above_path,
         width=640,
         height=480,
         fps=FPS,
     ),
     "wrist": OpenCVCameraConfig(
-        index_or_path=int(os.environ.get("LEROBOT_WRIST_CAMERA", 4)),
+        index_or_path=_wrist_path,
         width=640,
         height=480,
         fps=FPS,
