@@ -1,57 +1,50 @@
 # lerobo机械臂为COM*，piper机械臂为can*
-arm_port: COM3
+arm_port: can4
 arm_offset:
-  - 0
-  - -30
-  - -40
-  - -50
-  - 0
+  # - 0
+  # - 0
+  # - 0
+  # - 0.0
+  # - 0
+  # - 0
 
 # 机械臂类型，lerobo或piper
-arm_type: lerobo
+arm_type: piper
 
-# 机械臂后端，real表示真机，sim表示通过HTTP连接Isaac Sim等仿真服务
-# 仅在 arm_type=lerobo 时使用，sim 模式下无需设置 arm_port
-arm_backend: real
-
-# arm_backend=sim 时，Isaac Sim HTTP 服务的地址和端口
-arm_sim_host: 192.168.2.19
-arm_sim_port: 8770
-
-# arm_backend=sim 时的请求超时秒数
-arm_sim_timeout_s: 10.0
+# 机械臂运动速度百分比 1-100，100 为全速，值越小越慢越平稳
+arm_move_speed: 50
 
 # 关节角向量允许的均方误差阈值，小于该值认为到达目标点，单位平方度
 arm_reach_mse_threshold_deg2: 1.0
 
 # 不用远程摄像头则置空
 camera_ip: 
-camera_port: 8083
+camera_port: 8084
 
 # 以web形式显示图片的端口（起一个网络服务器），以便在无图形化环境运行，置空则直接用opencv的图片显示窗口
-cv2_headless_port: 8765
+cv2_headless_port: 8079
 
-# 默认桌面高度，即在机械臂坐标系下桌面的z坐标，通常是实测出来的，单位米
-default_desktop_height: 0.075
+# 默认桌面高度，即在机械臂坐标系下桌面的z坐标，单位米
+default_desktop_height: 0.135
 
 # 抓取动作间的停顿时间，单位秒
-catch_time_interval_s: 0.1
+catch_time_interval_s: 0.5
 
 # 获取机械臂各舵机角度值的重试次数
 get_arm_angles_retry_times: 3
 
 # 机械臂移动到旁边的位置，以免挡住相机视野，(x,y,z)，单位米
-default_gripper_aside_pos:
-  - 0.1
-  - 0.0
-  - 0.12
+# default_gripper_aside_pos:
+#   - 0.0
+#   - 0.2
+#   - 0.15
 
 # =======大模型=======
 
 # 请求大模型的平台url
 # llm_base_url: https://openrouter.ai/api/v1
 # llm_base_url: https://api.ohmygpt.com/v1
-llm_base_url: http://192.168.0.19:8001/v1
+llm_base_url: http://192.168.2.19:8001/v1
 
 # 大模型平台的api_key，本地部署则随便填，但不要为空
 llm_api_key: any
@@ -59,8 +52,8 @@ llm_api_key: any
 # 提示词文件
 prompts_file: prompts.toml
 
-# 代理地址，如请求大模型失败可设置或取消代理，注意若本地代理开了TUN模式，这里不设置代理可能会请求不到
-https_proxy: 
+# 代理地址，如请求大模型失败可设置或取消代理
+https_proxy: 192.168.0.12:7890
 
 # 使用的大模型名称，见https://openrouter.ai/models 或 https://www.ohmygpt.com/models，必须是支持多模态输入的模型
 # llm_model: gemini-3-flash-preview
@@ -76,7 +69,7 @@ RotationCam2Arm: true
 audio2text_backend: no-xunfei
 
 # 自部署语音转文字服务地址
-whisper_url: http://192.168.0.19:8000
+whisper_url: http://192.168.2.19:8000
 whisper_username: wowrobo
 whisper_password: wowrobo
 
@@ -94,38 +87,103 @@ APIKey:
 
 # 以项目根目录为基准
 classification_YOLO_model_path:
-  - object_detect/runs/积木方块/best.pt
+  - /home/czn/roboarm/object_detect/runs/best.pt
 
 # 默认YOLO识别置信度阈值
-default_conf_thres: 0.85
+default_conf_thres: 0.5
 
 # 夹爪闭合阈值，小于该值认为夹取失败，范围是[0,1]，越大越开，1表示完全张开（不是角度）
 default_gripper_close_threshold: 0.05
 
+# 各类别放置位置，(x,y)，单位米
+# - pos: 录制阶段固定放置位置
+#     字符串（符号坐标）：x/-x/y/-y 分别表示 target_x/-target_x/target_y/-target_y
+#     数值（绝对坐标）：如 [0.2, 0.4] 直接使用该固定位置
+# - random_pos: auto-reset 阶段随机撒回范围，
+#     两元素列表 [[x_min, x_max], [y_min, y_max]]，与 pos 格式对齐
+# 未匹配到类别时使用下方 default 条目
+class_pos:
+  default:
+    pos: [0.05, 0.45] #
+    random_pos:
+      - [0.0, 0.45]
+      - [-0.3, 0.3]
+  potato:
+    pos: [0.05, 0.4]
+    random_pos:
+      - [0.2, 0.45]
+      - [-0.3, -0.1]
+    keywords:
+      - 'potato'
+      - '土豆'
+  tomato:
+    pos: [0.05, 0.4]
+    random_pos:
+      - [0.2, 0.45]
+      - [-0.1, 0.1]
+    keywords:
+      - 'tomato'
+      - '西红柿'
+  carrot:
+    pos: [0.05, 0.4]
+    random_pos:
+      - [0.2, 0.45]
+      - [0.1, 0.3]
+    keywords:
+      - 'carrot'
+      - '胡萝卜'
+
 # 各类别放置位置，(x,y)，单位米，xy分别表示其原始位置xy，未指定则放回原处
 # keywords表示大模型输出的标签中含有其中某个关键词即认为是这个类别
 place_pos:
-  blue_block:
+  potato:
     pos:
-      - 0.2
-      - 0
-    keywords:
-      - 'blue'
-      - '蓝'
-  white_block:
-    pos:
-      - y
       - x
+      - -y
     keywords:
-      - 'white'
-      - '白'
-
-
+      - 'potato'
+      - '土豆'
+  tomato:
+    pos:
+      - x
+      - -y
+    keywords:
+      - 'tomato'
+      - '西红柿'
+  carrot:
+    pos:
+    - x
+    - -y
+    keywords:
+      - 'carrot'
+      - '胡萝卜'
+random_pos:
+  potato:
+    pos:
+      - x
+      - -y
+    keywords:
+      - 'potato'
+      - '土豆'
+  tomato:
+    pos:
+      - x
+      - -y
+    keywords:
+      - 'tomato'
+      - '西红柿'
+  carrot:
+    pos:
+    - x
+    - -y
+    keywords:
+      - 'carrot'
+      - '胡萝卜'
 # 离放置位置多近时无需抓取，以免反复抓放，单位米，未指定则为0
-place_distance_threshold: 0.05
+place_distance_threshold: 0.00
 
 # 抓取时为避免刚好顶到物体，夹爪向外偏移一些的距离，单位米
-catch_offset: 0.01
+catch_offset: 0.00
 
 # 抓取前抬起的高度，单位米
 catch_raise_height: 0.1
@@ -134,7 +192,17 @@ catch_raise_height: 0.1
 place_raise_height: 0.1
 
 # 放置时是否先下降再松开夹爪，默认否
-go_down_before_open_gripper_in_place: False
+go_down_before_open_gripper_in_place: true
+
+# --- auto-reset（随机撒回桌面）参数 ---
+# 各类别的随机撒回范围已移至上方 class_pos.{类别}.random_pos 中
+# 工作空间边界，(x_min, x_max)，超出此范围的坐标会被拒绝
+workspace_x_range: [-0.1, 0.55]
+workspace_y_range: [-0.3, 0.55]
+# 随机放置位置离抓取点的最小距离，单位米
+reset_min_place_dist_m: 0.20
+# 每轮最多随机撒回的物体数量
+reset_max_objects_per_cycle: 1
 
 # =======主从臂跟随场景=======
 

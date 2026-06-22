@@ -18,7 +18,7 @@ recordings/
 
 *.txt
 .env
-!requirements.txt
+.venv/
 
 cmd
 

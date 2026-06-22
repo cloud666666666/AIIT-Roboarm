@@ -78,8 +78,8 @@ uv --version   # 应 >= 0.5.0
 git clone git@github.com:cloud666666666/AIIT-Roboarm.git 
 cd ~/roboarm
 
-# 克隆 LeRobot 依赖（与 roboarm 同级或任意位置）
-git clone https://github.com/huggingface/lerobot.git 
+# 克隆 LeRobot 依赖（我们修改过的版本，与 roboarm 同级或任意位置）
+git clone git@github.com:cloud666666666/roboarm-lerobot.git lerobot
 
 # 创建软链接，让 roboarm 能找到 lerobot 源码
 # 将源路径替换为你实际克隆 lerobot 的位置
