@@ -8,6 +8,7 @@ Workflow per episode:
 
 Combines catch_with_arm_record_piper.py (recording) and auto_reset_record.py (reset).
 Keyboard: n/→ = end episode, r/← = rerecord, q/Esc = stop, s = skip reset.
+暂未完成！！！
 """
 
 import os
@@ -75,6 +76,8 @@ RESET_MAX_OBJECTS_PER_CYCLE: int | None = None
 # After a successful catch & place, wait this many seconds then auto-advance
 # to the next episode. Set to 0 to advance immediately after grasp.
 AUTO_ADVANCE_DELAY_S = 3.0
+
+MOVE_SPEED = get_config_value("arm_move_speed", 100, raise_if_missing=False)  # 机械臂运动速度百分比 1-100
 
 camera_config: dict[str, OpenCVCameraConfig] = {
     "orbbec": OpenCVCameraConfig(
@@ -1037,8 +1040,9 @@ def main():
         cameras=cameras,
         task=TASK,
         fps=FPS,
+        move_speed=MOVE_SPEED,
     )
-    arm.timeout = 15
+    arm.timeout = 15 * 100 / MOVE_SPEED  # 录制时基超时 15s，随速度反比缩放
     arm.move_to_home(gripper_open_0to1=0.8)
 
     models = [load_model(path) for path in model_paths]

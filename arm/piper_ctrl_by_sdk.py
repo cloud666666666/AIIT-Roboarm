@@ -43,18 +43,30 @@ class PiperBySDK(Arm):
     DEFAULT_DOWN_EULER_DEG_ZYX = [0.0, 180.0, 0.0]
     MAX_GRIPPER_ANGLE_DEG = 100
 
-    def __init__(self, move_mode_end_pose: bool = False, debug_mode: bool = False):
+    def __init__(
+        self,
+        move_mode_end_pose: bool = False,
+        debug_mode: bool = False,
+        move_speed: int = 100,
+    ):
         """初始化 Piper 机械臂控制器。
 
         Args:
             move_mode_end_pose: 是否默认使用末端位姿控制模式。
-            debug_mode: 是否使用调试模式；调试模式下速度更保守、超时更长。
+            debug_mode: 是否使用调试模式；调试模式下超时更长、夹爪力更保守。
+            move_speed: 运动速度百分比，范围 1-100，默认 100（全速）。
+                值越小机械臂运动越慢、越平稳。
         """
         super().__init__()
         self.debug_mode = debug_mode
         self.move_mode_end_pose = move_mode_end_pose
-        self.timeout = 10 if debug_mode else 5
-        self.steps = 100
+        self.move_speed = max(min(int(move_speed), 100), 1)
+        base_timeout = 10 if debug_mode else 5
+        self.timeout = base_timeout * 100 / self.move_speed  # 低速时等比例延长超时
+        # 插值步数与速度成反比：move_speed 越小步数越多，运动越慢越平滑。
+        # move_spd_rate_ctrl 在关节控制模式 (JointCtrl) 下不一定生效，
+        # 因此通过增加插值步数来降低实际运动速度。
+        self.steps = max(100, int(100 * 100 / self.move_speed))
 
         # 加载 URDF 构建运动学链
         urdf_path = (
@@ -617,7 +629,7 @@ class PiperBySDK(Arm):
         self.piper.MotionCtrl_2(
             ctrl_mode=0x01,
             move_mode=0x0 if move_mode_end_pose else 0x01,
-            move_spd_rate_ctrl=50 if self.debug_mode else 100,
+            move_spd_rate_ctrl=self.move_speed,
             is_mit_mode=0x00,
         )
         while True:
