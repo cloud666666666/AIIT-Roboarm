@@ -19,7 +19,7 @@ recordings/
 *.txt
 .env
 .venv/
-
+push_dataset_ms.py
 cmd
 
 !docs/*
