@@ -15,6 +15,7 @@ tmp/
 sim/camera_simple_opt_output/
 sim/koch_img/
 recordings/
+logs/
 
 *.txt
 .env

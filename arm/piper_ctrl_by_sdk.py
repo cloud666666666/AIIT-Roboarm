@@ -61,8 +61,10 @@ class PiperBySDK(Arm):
         self.debug_mode = debug_mode
         self.move_mode_end_pose = move_mode_end_pose
         self.move_speed = max(min(int(move_speed), 100), 1)
-        base_timeout = 10 if debug_mode else 5
-        self.timeout = base_timeout * 100 / self.move_speed  # 低速时等比例延长超时
+        # 基准超时（100% 速度时的超时秒数）。set_move_speed 会以它为基准
+        # 按速度反比缩放；录制等场景可直接改 self.timeout_base_s 覆盖默认值。
+        self.timeout_base_s = 10 if debug_mode else 5
+        self.timeout = self.timeout_base_s * 100 / self.move_speed  # 低速时等比例延长超时
         # 插值步数与速度成反比：move_speed 越小步数越多，运动越慢越平滑。
         # move_spd_rate_ctrl 在关节控制模式 (JointCtrl) 下不一定生效，
         # 因此通过增加插值步数来降低实际运动速度。
@@ -115,6 +117,29 @@ class PiperBySDK(Arm):
         self.reset(self.move_mode_end_pose)
 
     # ========== 高层接口实现 ==========
+
+    def set_move_speed(self, move_speed: int) -> None:
+        """更新运动速度百分比并同步相关参数。
+
+        速度影响三处：SDK 的 `move_spd_rate_ctrl`、插值步数 `self.steps`
+        （与速度成反比，越慢步数越多越平滑）以及等比例延长的到位超时。
+
+        Args:
+            move_speed: 运动速度百分比，范围 1-100，越小越慢越平稳。
+        """
+        self.move_speed = max(min(int(move_speed), 100), 1)
+        # 以 timeout_base_s 为基准按速度反比缩放，尊重外部对基准超时的覆盖
+        # （如录制脚本把基准设为 15s）。
+        self.timeout = self.timeout_base_s * 100 / self.move_speed
+        self.steps = max(100, int(100 * 100 / self.move_speed))
+        # 关节控制模式下 move_spd_rate_ctrl 不一定生效，但末端位姿模式下有效，
+        # 一并同步以覆盖两种模式。
+        self.piper.MotionCtrl_2(
+            ctrl_mode=0x01,
+            move_mode=0x0 if self.move_mode_end_pose else 0x01,
+            move_spd_rate_ctrl=self.move_speed,
+            is_mit_mode=0x00,
+        )
 
     def get_raw_joint_angles(
         self, retry_times=None

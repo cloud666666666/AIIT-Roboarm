@@ -14,14 +14,15 @@
 - [配置说明](#配置说明)
   - [config.yaml 关键配置项](#configyaml-关键配置项)
   - [YOLO 模型准备](#yolo-模型准备)
-- [自动采集数据](#自动采集数据)
+- [手眼标定（抓取/采集前必须）](#手眼标定抓取采集前必须)
+- [半自动采集数据](#半自动采集数据)
   - [概述](#概述)
   - [工作流程](#工作流程)
   - [使用方法](#使用方法)
   - [键盘控制](#键盘控制)
-  - [采集模式说明](#采集模式说明)
   - [数据保存与断点续采](#数据保存与断点续采)
   - [头部无显示运行](#头部无显示运行)
+- [VLA 模型推理与部署](#vla-模型推理与部署)
 - [其他场景](#其他场景)
 - [机械臂坐标系](#机械臂坐标系)
 - [故障排查](#故障排查)
@@ -33,9 +34,12 @@
 | 设备 | 说明 |
 |------|------|
 | Piper 机械臂 | 通过 USB-CAN 适配器连接，CAN 总线通信 |
-| Orbbec 深度相机 | 通过 USB 连接，用于目标检测与视觉反馈 |
+| Orbbec 深度相机 | 通过 USB 连接，作为俯视（above）相机，用于目标检测与视觉反馈 |
+| Intel RealSense 相机（可选） | 作为腕部（wrist）相机，用于双视角 VLA 数据采集与推理 |
 | USB-CAN 适配器 | 连接机械臂与主机 |
 | Jetson Orin / 任意 Linux 主机 | 运行控制程序 |
+
+> **相机说明**：数据采集与推理默认使用双相机——Orbbec Gemini 作为俯视相机（`observation/image`），Intel RealSense 作为腕部相机（`observation/wrist_image`）。若只做单相机场景（LLM 抓取、象棋等），仅需 Orbbec 相机。
 
 ---
 
@@ -179,6 +183,9 @@ uv run python arm/piper_ctrl_by_sdk.py
 arm_port: can4          # Piper 为 can*，Lerobo 为 COM*
 arm_type: piper         # piper 或 lerobo
 arm_offset: [0, -30, -40, -50, 0]  # 关节零位偏移，单位度
+arm_move_speed: 50      # 运动速度百分比 1-100，值越小越慢越平稳
+arm_reach_mse_threshold_deg2: 1.0  # 到位判定阈值（关节角均方误差，单位平方度）
+get_arm_angles_retry_times: 3      # 读取舵机角度的重试次数
 ```
 
 #### 相机
@@ -229,6 +236,8 @@ class_pos:
 
 #### Auto-Reset 参数
 
+> 以下参数（含上方 `class_pos.*.random_pos`）仅供全自动复位脚本 `record_and_auto_reset.py` 使用。该全自动方案实测行不通，实际采集用[半自动方案](#半自动采集数据)（人工摆放物体），这些参数可忽略。
+
 ```yaml
 workspace_x_range: [-0.1, 0.55]   # 工作空间 X 范围，超出会拒绝
 workspace_y_range: [-0.3, 0.55]   # 工作空间 Y 范围
@@ -263,32 +272,57 @@ go_down_before_open_gripper_in_place: true  # 放置时先下降再松爪
 
 ---
 
-## 自动采集数据
+## 手眼标定（抓取/采集前必须）
+
+> ⚠️ **这一步不可跳过**。YOLO 自动抓取和数据采集都依赖 2D 手眼标定：程序用它把相机像素坐标 `(u, v)` 转换成机械臂平面坐标 `(x, y)`（见 [arm/arm_base.py:469](arm/arm_base.py#L469) 的 `pixel2pos`）。标定矩阵保存在 `arm/hand-eye-data/2d_homography.npy`，而该目录已被 `.gitignore` 忽略——**克隆后是空的，必须自己标定生成**，否则抓取/采集运行时会报 `没有手眼标定数据，无法转换图像坐标`。
+
+标定脚本为 `arm/calibrate_handeye_2d.py`，支持两种模式：
+
+```bash
+# 方式 A：手动采点（在相机画面上点击 → 拖动机械臂末端到该点 → 记录，重复 4+ 个点）
+uv run python arm/calibrate_handeye_2d.py --mode calibrate
+
+
+# 方式 B：测试已有标定（复用 2d_homography.npy，点击画面验证映射是否准确）
+uv run python arm/calibrate_handeye_2d.py --mode test
+```
+
+标定完成后会在 `arm/hand-eye-data/` 生成 `2d_homography.npy`（以及 `2d_image_points.npy`、`2d_end_poses.npy` 等中间数据）。`calibrate` 模式采点结束后会打印重投影误差，误差越小标定越准，建议内点平均误差在毫米级。
+
+标定要点：
+
+- 相机与机械臂的相对位置一旦改变，必须重新标定
+- 标定时机械臂末端和点击点应尽量落在同一桌面高度平面（`default_desktop_height`）
+- 采点尽量覆盖整个工作空间，避免全部集中在一小块区域
+
+
+
+---
+
+## 半自动采集数据
 
 ### 概述
 
-`classification/record_and_auto_reset.py` 是一个完整的 VLA 数据自动采集流水线，整合了：
+`classification/catch_with_arm_record_piper.py` 是半自动 VLA 数据采集脚本：**录制阶段全自动**（YOLO 检测 → 机械臂抓取 → 放入收集箱 → 保存为 LeRobot 格式数据），**每轮之间的复位由人工手动完成**（重新摆放抓取物体的位置，摆好后按键进入下一轮）。
 
-- **录制阶段**：YOLO 检测目标物体 → 机械臂抓取 → 放入收集箱 → 保存为 LeRobot 格式数据
-- **复位阶段**：YOLO 检测桌上所有目标物体 → 逐个移动到随机位置 → 为下一轮采集创造新场景
+> **为什么是半自动**：项目里还有一个全自动流水线 `record_and_auto_reset.py`，尝试让机械臂自己把物体重新摆到随机位置来创造新场景，但实测行不通（复位不稳定），因此实际采集改用本节的半自动方案——机械臂只负责录制阶段的抓取，物体摆放交给人工。
 
 ### 工作流程
 
 ```
 ┌─ Episode N ──────────────────────────────────────┐
 │                                                   │
-│  1. Recording Phase (录制)                         │
+│  1. Recording Phase (录制，全自动)                 │
 │     ├─ 相机持续拍摄                                 │
 │     ├─ YOLO 检测目标物体                            │
 │     ├─ 机械臂移动到目标位置抓取                       │
 │     ├─ 放入收集箱                                   │
 │     └─ 自动保存 MP4 + 关节状态到 LeRobot 数据集      │
 │                                                   │
-│  2. Auto-Reset Phase (复位)                        │
-│     ├─ 机械臂归零，相机获取清晰视野                   │
-│     ├─ YOLO 检测桌上所有目标物体                     │
-│     ├─ 逐个抓取 → 移动到随机位置                      │
-│     └─ 为下一轮采集创造不同的初始场景                  │
+│  2. Reset Phase (复位，人工)                       │
+│     ├─ 画面提示 "RESET - Press Right arrow ..."    │
+│     ├─ 人工重新摆放抓取物体的位置                     │
+│     └─ 摆好后按右箭头 / n 进入下一轮                  │
 │                                                   │
 │  3. 循环直到 NUM_EPISODES 完成                      │
 │                                                   │
@@ -299,54 +333,46 @@ go_down_before_open_gripper_in_place: true  # 放置时先下降再松爪
 
 #### 1. 修改脚本中的采集参数
 
-编辑 `classification/record_and_auto_reset.py` 顶部配置区：
+编辑 `classification/catch_with_arm_record_piper.py` 顶部配置区：
 
 ```python
 DATASET_ROOT = "/home/czn/dataset/piper_yolopick"  # 数据集保存路径
 NUM_EPISODES = 1000       # 总共采集的 episode 数量
-TARGET_CLASS = "carrot"   # 目标类别（carrot / potato / tomato / 空字符串=所有）
-TASK = "pick the carrot toy and place into box"  # 任务描述（写入数据集）
-RESUME = True             # True=断点续采, False=从头开始
-AUTO_ADVANCE_DELAY_S = 3.0  # 抓取成功后自动推进等待秒数（0=立即推进）
+FPS = 30                  # 采集帧率
+EPISODE_TIME_S = 6000     # 单个 episode 最长录制时长（秒），一般靠按键提前结束
+RESUME = True             # True=断点续采, False=从头开始（目标目录已存在则报错）
+TARGET_CLASS_LIST = ["carrot", "potato", "tomato"]  # 目标类别列表，按 episode 逐轮轮换
 ```
+
+> **数据格式**：采集的观测为 7 维状态 `[joint_1..6 (deg), gripper_0to1 * 100]`，动作空间相同；图像包含俯视相机 `observation/image`（Orbbec）与腕部相机 `observation/wrist_image`（RealSense）。此格式与 VLA 推理客户端 `classification/main.py` 严格对齐。
 
 #### 2. 运行采集
 
 ```bash
-uv run python classification/record_and_auto_reset.py
+uv run python classification/catch_with_arm_record_piper.py
 ```
 
 #### 3. 启动后的交互
 
-程序启动后会打印当前配置和键盘快捷键，显示：
+程序启动后会打印数据保存路径和键盘快捷键：
 
 ```
-Integrated record + auto-reset pipeline
-  Data saved to: /home/czn/dataset/piper_yolopick
-  Target class:  carrot
-  Episodes:      1000
-  Resume:        True (starting from episode 5)
-Controls:
-  n/→  = end current episode
-  r/←  = discard episode & rerecord
-  s    = skip auto-reset this cycle
-  q/Esc = stop entirely
+开始录制，数据保存到 /home/czn/dataset/piper_yolopick
+操作方式：
+  n/右箭头 -> 结束当前 episode
+  r/左箭头 -> 丢弃当前 episode 并重录
+  q/Esc    -> 停止录制
 ```
 
 ### 键盘控制
 
 | 按键 | 功能 |
 |------|------|
-| `n` / `→`（右箭头） | 立即结束当前 episode，保存数据，进入下一轮 |
+| `n` / `→`（右箭头） | 结束当前 episode，保存数据；在复位阶段则表示"已摆好，进入下一轮" |
 | `r` / `←`（左箭头） | 丢弃当前 episode（不保存），重新录制 |
-| `s` | 跳过本轮 auto-reset 阶段（直接进入下一 episode） |
 | `q` / `Esc` | 停止采集，保存当前数据后退出 |
 
-### 采集模式说明
-
-**无人值守模式**：`AUTO_ADVANCE_DELAY_S` 设置后，每次抓取成功会自动推进到下一 episode，无需按键。设置为 `0` 则抓取完成后立即进入复位阶段。
-
-**手动控制模式**：按 `n/→` 手动推进，适合需要精细控制的场景。
+> **复位交互**：一个 episode 录完后，画面会显示 `RESET - Press Right arrow when ready`。此时人工把抓取物体重新摆到合适位置，摆好后按 `n` / 右箭头即开始下一轮录制。
 
 ### 数据保存与断点续采
 
@@ -356,20 +382,6 @@ Controls:
 - **`RESUME = True`** 时，重启程序会自动检测已有 episode 数量，从断点继续
 - 异常退出时，程序会尝试保存当前 episode 的已录制部分
 - **`RESUME = False`** 时，如果目标目录已存在则报错
-
-### 单独运行各阶段
-
-如果只需要录制（不复位），使用原始脚本：
-
-```bash
-uv run python classification/catch_with_arm_record_piper.py
-```
-
-如果只需要复位（不录制）：
-
-```bash
-uv run python classification/auto_reset_record.py
-```
 
 ### 头部无显示运行
 
@@ -382,6 +394,65 @@ cv2_headless_port: 8079
 启动程序后，在浏览器中访问 `http://<jetson-ip>:8079/?window=Recording` 即可实时查看相机画面和检测结果。
 
 > 启动 Flask 服务器需要约 2-5 秒（Jetson 上较慢），程序会在启动时预热显示。
+
+---
+
+## VLA 模型推理与部署
+
+采集完数据并训练出 VLA 策略后，用 `classification/main.py` 在真机上做闭环推理。它连接 [openpi](https://github.com/Physical-Intelligence/openpi) 策略服务器，发送相机图像 + 机械臂状态，接收动作序列并下发到 Piper 机械臂。
+
+### 数据格式对齐
+
+推理客户端的观测/动作格式与训练录制器 `catch_with_arm_record_piper.py` **严格一致**：
+
+| 字段 | 含义 |
+|------|------|
+| `observation/state` | `[joint_1..6 (deg), gripper_0to1 * 100]`，7 维 |
+| `action` | 同 state 的 7 维空间（绝对关节角度 + 夹爪 * 100） |
+| `observation/image` | 俯视相机（Orbbec），RGB HxWx3 |
+| `observation/wrist_image` | 腕部相机（Intel RealSense），RGB HxWx3 |
+
+### 运行步骤
+
+1. **启动策略服务器**（在训练机 / GPU 机器上，需先安装 openpi）：
+
+   ```bash
+   # openpi 项目内，加载训练好的 pi05_piper 权重
+   python scripts/serve_policy.py --port 8002
+   ```
+
+2. **在 Piper 主机上安装 openpi 客户端依赖**（装入 roboarm 的 venv）：
+
+   ```bash
+   uv pip install -e /home/czn/openpi/packages/openpi-client
+   ```
+
+3. **先干跑（dry-run）验证**——只打印动作、不驱动机械臂：
+
+   ```bash
+   uv run python classification/main.py --host <策略服务器IP> --port 8002 --dry_run
+   ```
+
+4. **真机推理**：
+
+   ```bash
+   uv run python classification/main.py \
+     --host <策略服务器IP> --port 8002 \
+     --prompt "pick the carrot toy and place into box"
+   ```
+
+### 关键参数
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--host` / `--port` | `10.0.105.11` / `8002` | 策略服务器地址 |
+| `--prompt` | pick the carrot ... | 任务指令，需与训练时的措辞风格一致 |
+| `--actions_per_chunk` | 10 | 每次推理执行的动作步数，越小闭环越紧（网络往返更多） |
+| `--control_dt` | 0.033 | 相邻动作下发间隔（≈ 1/30s，与训练帧率对齐） |
+| `--move_speed` | 100 | 启动归零 / 控制模式速度百分比 |
+| `--dry_run` | False | 只记录动作不驱动机械臂，首次运行务必先开启 |
+
+> **安全提示**：首次部署或更换权重后，务必先用 `--dry_run` 确认动作合理，并适当降低 `--move_speed`，再进行真机运动。推理时机械臂会以接近开环方式执行模型输出的密集轨迹，请确保工作空间内无人无障碍。
 
 ---
 
@@ -421,14 +492,7 @@ uv run python leader_follower/leader_follower.py
 
 ### 2D 手眼标定
 
-`arm/calibrate_handeye_2d.py` 用于标定相机像素坐标到机械臂基座坐标系的映射：
-
-1. 在相机画面上点击一个点
-2. 手动控制机械臂末端移动到该点对应的实际桌面位置
-3. 重复 4+ 个点
-4. 自动计算单应性矩阵
-
-详见 [Roboarm 机械臂文档](https://s1vvxephwhf.feishu.cn/wiki/Ulmsw4FPziq8oFkb8eXcx875nfe)
+相机像素坐标到机械臂基座坐标系的映射由 2D 手眼标定得到，是 YOLO 抓取/采集的前置步骤。完整流程和三种标定模式见上文 [手眼标定（抓取/采集前必须）](#手眼标定抓取采集前必须)。
 
 ---
 
@@ -508,6 +572,12 @@ sudo ip link set "$CAN_IF" up
 - 确认 `camera_ip` 为空（使用本地相机）或填写了正确的远程相机 IP
 - 检查 udev 规则是否已安装：`camera/scripts/` 中有 Orbbec 设备的 udev 配置文件
 
+### 报错「没有手眼标定数据，无法转换图像坐标」
+
+**原因**：`arm/hand-eye-data/2d_homography.npy` 不存在。该目录被 `.gitignore` 忽略，克隆后需自行标定生成。
+
+**解决**：先执行 [手眼标定（抓取/采集前必须）](#手眼标定抓取采集前必须)，生成标定矩阵后再运行抓取/采集脚本。
+
 ---
 
 ## 项目结构
@@ -516,7 +586,7 @@ sudo ip link set "$CAN_IF" up
 roboarm/
   arm/              # 机械臂控制（Piper + Lerobo），手眼标定
   camera/           # Orbbec 深度相机 + USB 相机控制
-  classification/   # YOLO 自动抓取 + 数据采集流水线
+  classification/   # YOLO 自动抓取 + 数据采集流水线 + VLA 推理客户端(main.py)
   object_detect/    # YOLO OBB 模型训练与检测
   llm/              # LLM 视觉识别与指令理解
   chess/            # 中国象棋场景
