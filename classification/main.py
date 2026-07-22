@@ -45,13 +45,13 @@ MAX_GRIPPER_ANGLE_DEG = 100.0
 class Args:
     # Policy server connection.
     host: str = "10.0.105.11"
-    # host: str = "127.0.0.1"
+    host: str = "127.0.0.1"
     port: int = 8002
     api_key: str | None = None
 
     # Task instruction. Must match a prompt style seen in training, e.g.
     # "pick the potato toy and place into box" (potato/carrot/tomato).
-    prompt: str = "pick the carrot toy and place into box"
+    prompt: str = "pick the potato toy and place into box"
 
     # roboarm project root (provides the Piper SDK + cameras).
     repo: str = "/home/czn/roboarm"
@@ -60,7 +60,7 @@ class Args:
     # only execute the first `actions_per_chunk` waypoints, then re-observe and
     # re-query. Smaller = tighter closed loop (more network round-trips); larger =
     # more open-loop. 8 keeps the loop tight.
-    actions_per_chunk: int = 10
+    actions_per_chunk: int = 50
     # Seconds between consecutive waypoints streamed to the arm (≈ 1/control_hz).
     # Training was recorded at 30 FPS, so 0.033 matches the trajectory's intended
     # playback rate. Increase (slower) for a cautious first run.

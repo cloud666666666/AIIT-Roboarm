@@ -5,6 +5,7 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 from arm.arm_base import Arm
 from utils.config_getter import get_config_value
+import argparse
 import numpy as np
 from object_detect.detect import (
     detect_objects_in_frame,
@@ -18,7 +19,24 @@ import concurrent.futures
 import copy
 from utils.cv2_display import show_image, poll_key, destroy_all_windows
 
-def main():
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="调用目标识别和机械臂控制，实现抓取功能。"
+    )
+    parser.add_argument(
+        "--target",
+        default='carrot',
+        help=(
+            "指定要抓取的物体类别名（class_name）。"
+            "指定后只抓该类别中置信度最高的物体；"
+            "不指定则抓全部检测中置信度最高的物体。"
+        ),
+    )
+    return parser.parse_args()
+
+
+def main(target_class: str = None):
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     model_paths = [
         os.path.join(os.path.dirname(os.path.dirname(__file__)), path)
@@ -60,9 +78,28 @@ def main():
                             model, frame, conf_thres=default_conf_thres
                         )
                     )
+
+            # 先画出所有检测框，便于观察
             for (u, v, w, h, r), score, class_id, class_name in detections:
-                angle_deg = np.rad2deg(r)
-                if future is None or future.done():
+                draw_box(
+                    frame, u, v, w, h, np.rad2deg(r), f"{class_name}: {score:.2f}"
+                )
+
+            # 选出本轮要抓取的目标：
+            # - 指定了 target_class 时，只在该类别里挑；
+            # - 未指定时，从所有检测里挑；
+            # 两种情况都取置信度（score）最高的那个。
+            if future is None or future.done():
+                candidates = detections
+                if target_class is not None:
+                    candidates = [
+                        d for d in detections if d[3] == target_class
+                    ]
+                if candidates:
+                    (u, v, w, h, r), score, class_id, class_name = max(
+                        candidates, key=lambda d: d[1]
+                    )
+                    angle_deg = np.rad2deg(r)
                     # 将图像坐标转换为机械臂坐标系
                     target_x, target_y = arm.pixel2pos(u, v)
                     gripper_angle_rad = arm.gripper_angle_by_longer(
@@ -110,7 +147,6 @@ def main():
                             gripper_angle_rad,
                             class_place_pos["pos"],
                         )
-                draw_box(frame, u, v, w, h, angle_deg, f"{class_name}: {score:.2f}")
 
             if default_gripper_aside_pos and (future is None or future.done()):
                 # 移到旁边以免挡住视野
@@ -148,4 +184,5 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    main(target_class=args.target)
