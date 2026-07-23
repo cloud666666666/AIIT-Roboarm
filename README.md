@@ -46,6 +46,9 @@
     - [关键参数](#关键参数)
   - [其他场景](#其他场景)
     - [物品分类抓取（LLM 视觉识别）](#物品分类抓取llm-视觉识别)
+      - [VLM 识别与抓取代码路径](#vlm-识别与抓取代码路径)
+      - [运行前配置](#运行前配置)
+      - [运行流程](#运行流程)
     - [中国象棋](#中国象棋)
     - [主从臂跟随](#主从臂跟随)
   - [机械臂坐标系](#机械臂坐标系)
@@ -540,11 +543,74 @@ cv2_headless_port: 8079
 
 ### 物品分类抓取（LLM 视觉识别）
 
-使用大模型进行视觉识别和指令理解，实现自然语言控制抓取：
+使用 VLM（视觉语言模型）同时分析相机画面和自然语言指令，定位目标物体，转换为机械臂坐标后完成抓取与分类放置。
+
+#### VLM 识别与抓取代码路径
+
+| 路径 | 作用 |
+|------|------|
+| `llm/catch_by_llm.py` | 主入口；读取相机画面和文字/语音指令，调用 VLM，并执行抓取、放置和成功率统计 |
+| `llm/llm_detect.py` | 图像编码、相机方向修正、VLM 检测请求及检测结果聚合 |
+| `llm/llm_api.py` | OpenAI 兼容多模态接口客户端，读取模型地址、模型名和提示词配置 |
+| `prompts.toml` | `user_instruction_prompt` 等 VLM 提示词模板 |
+| `arm/arm_base.py` | 像素坐标转换、夹爪角度计算以及 `catch_and_place()` 抓放动作 |
+| `llm/fine_tuing/` | VLM 数据标注、微调、LoRA 合并、部署和评测脚本；详见该目录下的 `README.md` |
+
+调用链如下：
+
+```text
+llm/catch_by_llm.py
+  → llm/llm_detect.py
+  → llm/llm_api.py + prompts.toml
+  → VLM 返回目标边界框
+  → arm/arm_base.py: pixel2pos() / catch_and_place()
+```
+
+#### 运行前配置
+
+1. 完成上文的 [2D 手眼标定](#手眼标定抓取采集前必须)，确保存在 `arm/hand-eye-data/2d_homography.npy`。
+2. 根据 `config.yaml.example` 配置以下字段：
+
+```yaml
+# OpenAI 兼容的 VLM 服务
+llm_base_url: http://<VLM服务IP>:<端口>/v1
+llm_api_key: any                  # 本地服务也不能留空
+llm_model: output/merged-qwen3.5-9b-graspdet
+prompts_file: prompts.toml
+
+# 相机画面是否需要旋转 180°；主要影响左右、远近等空间判断
+RotationCam2Arm: true
+
+# 各类别的放置位置及匹配关键词
+place_pos:
+  red:
+    pos: [0.1, 0.2]
+    keywords: ["red", "红色"]
+
+# 抓取点沿夹爪方向的补偿距离，单位米
+catch_offset: 0.00
+```
+
+`llm_base_url` 必须提供 OpenAI 兼容的 `/chat/completions` 多模态接口。使用仓库内微调模型时，可参考 `llm/fine_tuing/README.md` 和 `llm/fine_tuing/serve_vllm.sh` 启动本地服务。
+
+#### 运行流程
+
+当前脚本默认执行 `catch_by_text_instruction()`，指令列表定义在 `llm/catch_by_llm.py` 的 `instructions` 变量中。按需修改指令后运行：
 
 ```bash
 uv run python llm/catch_by_llm.py
 ```
+
+程序会依次执行：
+
+1. Orbbec 相机采集彩色画面。
+2. 将画面与自然语言指令发送给 VLM。
+3. VLM 返回目标类别、中心坐标、宽高和旋转信息。
+4. 使用 2D 手眼标定将目标像素坐标转换为机械臂平面坐标。
+5. 根据 `place_pos` 的关键词匹配放置区域，执行抓取与放置。
+6. 将本次结果写入 `llm/catch_stats.json`；按 `Esc` 退出并使机械臂回到 Home 位。
+
+如需使用麦克风语音指令，将脚本末尾的 `catch_by_text_instruction()` 改为 `catch_by_audio()`，并配置 `audio2text_backend` 及对应语音识别服务参数。
 
 ### 中国象棋
 
