@@ -56,7 +56,7 @@ ROBOT_TYPE = "piper_follower"
 ROBOT_ID = "piper"
 MOVE_SPEED = get_config_value("arm_move_speed", 100, raise_if_missing=False)  # 机械臂运动速度百分比 1-100，100 为全速，值越小越慢越平稳
 RESUME =  True  # True to resume from existing dataset, False to start fresh (must not exist)
-TARGET_CLASS_LIST = ["carrot","potato","tomato"]
+TARGET_CLASS_LIST = ["tomato"]
 TARGET_CLASS = TARGET_CLASS_LIST[0]
 TASK = f"pick the {TARGET_CLASS} toy and place into box"
 MOTOR_NAMES = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6", "gripper"]

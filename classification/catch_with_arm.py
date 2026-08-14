@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--target",
-        default='carrot',
+        default='tomato',
         help=(
             "指定要抓取的物体类别名（class_name）。"
             "指定后只抓该类别中置信度最高的物体；"
@@ -54,7 +54,7 @@ def main(target_class: str = None):
 
     arm = Arm()
     arm.move_to_home(gripper_open_0to1=1)
-    cam = Camera(color=True, depth=False)
+    cam = Camera(color=True, depth=False, undistort=True)
     models = [load_model(model_path) for model_path in model_paths]
     detections = []
     future = None

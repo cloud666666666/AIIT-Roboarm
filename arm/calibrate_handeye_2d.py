@@ -186,7 +186,7 @@ def collect_image_pose(image_points_path, end_poses_path):
 
     arm = Arm()
     arm.disable_torque()
-    cam = Camera(color=True, depth=False)
+    cam = Camera(color=True, depth=False, undistort=True)
     while True:
         try:
             frames = cam.get_frames()
@@ -372,7 +372,7 @@ def collect_board_correspondences(
 
     arm = Arm()
     arm.disable_torque()
-    cam = Camera(color=True, depth=False)
+    cam = Camera(color=True, depth=False, undistort=True)
 
     try:
         reference_indices = select_teaching_corner_indices(pattern_size)
@@ -457,10 +457,6 @@ def test_moveto(arm: Arm, homography_matrix, image_point, move_lock: threading.L
 
         target_x, target_y = image_to_robot_xy(homography_matrix, image_point)
         target_z = get_config_value("default_desktop_height")
-        print(
-            f"Clicked image point: ({image_point[0]}, {image_point[1]}), "
-            f"Mapped arm position: ({target_x}, {target_y})"
-        )
         arm.move_to(
             [float(target_x), float(target_y), target_z],
             gripper_open_0to1=1,
@@ -471,10 +467,17 @@ def test_moveto(arm: Arm, homography_matrix, image_point, move_lock: threading.L
 def test_handeye_2d(homography_matrix):
     arm = Arm()
     move_lock = threading.Lock()
+    last_click: dict[str, tuple[float, float]] = {}
 
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
-            print(f"Left button clicked at ({x}, {y})")
+            robot_point = image_to_robot_xy(homography_matrix, (x, y))
+            last_click["image"] = (x, y)
+            last_click["robot"] = (float(robot_point[0]), float(robot_point[1]))
+            print(
+                f"Left button clicked at ({x}, {y}), "
+                f"mapped arm position: ({robot_point[0]:.6f}, {robot_point[1]:.6f})"
+            )
             threading.Thread(
                 target=test_moveto,
                 args=(arm, homography_matrix, (x, y), move_lock),
@@ -484,7 +487,7 @@ def test_handeye_2d(homography_matrix):
     window_name = "Camera"
     set_mouse_callback(window_name, mouse_callback)
 
-    cam = Camera(color=True, depth=False)
+    cam = Camera(color=True, depth=False, undistort=True)
     while True:
         try:
             frames = cam.get_frames()
@@ -493,7 +496,22 @@ def test_handeye_2d(homography_matrix):
                 print("failed to get color image")
                 time.sleep(0.5)
                 continue
-            show_image(window_name, color_image)
+
+            image_to_show = color_image.copy()
+            if "image" in last_click:
+                cx, cy = last_click["image"]
+                rx, ry = last_click["robot"]
+                cv2.circle(image_to_show, (int(cx), int(cy)), 5, (0, 0, 255), -1)
+                cv2.putText(
+                    image_to_show,
+                    f"({rx:.4f}, {ry:.4f})",
+                    (int(cx) + 10, int(cy) - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.8,
+                    (0, 0, 255),
+                    2,
+                )
+            show_image(window_name, image_to_show)
 
             key = poll_key(1)
             if key == 27:
@@ -517,10 +535,10 @@ def main():
         help="模式: calibrate 手动采集多点; calibrate_board 半自动采集多点; test 测试",
     )
     argparser.add_argument(
-        "--pattern-cols", type=int, default=7, help="棋盘格每行内角点数"
+        "--pattern-cols", type=int, default=12, help="棋盘格每行内角点数（格子数-1）"
     )
     argparser.add_argument(
-        "--pattern-rows", type=int, default=7, help="棋盘格每列内角点数"
+        "--pattern-rows", type=int, default=12, help="棋盘格每列内角点数（格子数-1）"
     )
     argparser.add_argument(
         "--capture-count",
