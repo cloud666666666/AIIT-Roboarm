@@ -32,6 +32,7 @@ class Arm:
     _ARM_TYPES = {
         "piper": ("arm.piper_ctrl_by_sdk", "PiperBySDK"),
         "lerobo": ("arm.lerobo_arm_control", "LeroboArm"),
+        "jaka": ("arm.jaka_ctrl_by_sdk", "JakaBySDK"),
     }
 
     def __new__(cls, *args, **kwargs) -> Self:
@@ -193,6 +194,16 @@ class Arm:
         """
         raise NotImplementedError("move_to method must be implemented in subclass")
 
+    def prepare_for_manual_teach(self) -> bool:
+        """手动示教（如手眼标定拖动采点）前，摆到便于拖动的起始姿态。
+
+        默认回到 home；子类可覆写为更适合拖动的姿态（如夹爪朝下靠近工作区）。
+
+        Returns:
+            移动是否成功。
+        """
+        return self.move_to_home()
+
     def wait_until_reached(self, target_angles_deg: Sequence[float]) -> None:
         """轮询 /state 直到当前关节角与目标关节角的均方差小于阈值，或超时。
 
@@ -281,6 +292,11 @@ class Arm:
         yaw_term = (yaw_error / cls.IK_YAW_TOLERANCE_RAD) ** 2
         return float(pos_term + tilt_term + yaw_term)
 
+    def wait_gripper_gripped(self) -> None:
+        """等待夹爪夹取动作完成。默认固定等待 `catch_time_interval_s`，
+        子类可覆写为轮询夹爪实际状态（如位置稳定）。"""
+        time.sleep(self.catch_time_interval_s)
+
     def catch(
         self,
         target_x: float,
@@ -327,7 +343,7 @@ class Arm:
         time.sleep(self.catch_time_interval_s)
 
         self.set_gripper(gripper_open_0to1=0, step_callback=step_callback)
-        time.sleep(self.catch_time_interval_s)
+        self.wait_gripper_gripped()
 
         res = self.move_to(
             [target_x, target_y, target_z + self.catch_raise_height],

@@ -1,4 +1,4 @@
-# lerobo机械臂为COM*，piper机械臂为can*
+# lerobo机械臂为COM*，piper机械臂为can*，jaka机械臂为控制器IP（如10.5.5.100）
 arm_port: can4
 arm_offset:
   # - 0
@@ -8,7 +8,7 @@ arm_offset:
   # - 0
   # - 0
 
-# 机械臂类型，lerobo或piper
+# 机械臂类型，piper、lerobo或jaka
 arm_type: piper
 
 # 机械臂运动速度百分比 1-100，100 为全速，值越小越慢越平稳
@@ -18,7 +18,7 @@ arm_move_speed: 50
 arm_reach_mse_threshold_deg2: 1.0
 
 # 不用远程摄像头则置空
-camera_ip: 
+camera_ip:
 camera_port: 8084
 
 # 以web形式显示图片的端口（起一个网络服务器），以便在无图形化环境运行，置空则直接用opencv的图片显示窗口
@@ -74,13 +74,13 @@ whisper_username: wowrobo
 whisper_password: wowrobo
 
 # 语音转文字APIID（讯飞）
-APPID: 
+APPID:
 
 # 语音转文字APISecret
-APISecret: 
+APISecret:
 
 # 语音转文字APIKey
-APIKey: 
+APIKey:
 
 
 # =======物品分类场景=======
