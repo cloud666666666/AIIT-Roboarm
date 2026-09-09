@@ -130,7 +130,7 @@ def main(target_class: str = None):
                                 class_place_pos["pos"][1] = -target_y
                     if (
                         np.linalg.norm(
-                            np.array(class_place_pos.get("pos"))
+                            np.array(class_place_pos.get("pos")[:2])
                             - np.array([target_x, target_y])
                         )
                         < place_distance_threshold
