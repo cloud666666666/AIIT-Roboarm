@@ -1,6 +1,6 @@
 # ROBOARM — 机械臂 + 深度相机 自动采集与控制项目
 
-基于 Piper 机械臂 + Orbbec 深度相机 + YOLO 目标检测，实现自动抓取、分类放置、VLA 数据采集（LeRobot 格式）等功能。
+基于 Piper / JAKA 机械臂 + Orbbec 深度相机 + YOLO 目标检测，实现自动抓取、分类放置、VLA 数据采集（LeRobot 格式）等功能。
 
 ## 目录
 
@@ -16,6 +16,7 @@
       - [4.2 激活 CAN 接口](#42-激活-can-接口)
       - [4.3 验证 CAN 状态](#43-验证-can-状态)
     - [5. 连通性验证](#5-连通性验证)
+    - [6. 使用 JAKA 机械臂（可选）](#6-使用-jaka-机械臂可选)
   - [配置说明](#配置说明)
     - [config.yaml 关键配置项](#configyaml-关键配置项)
       - [机械臂连接](#机械臂连接)
@@ -54,7 +55,7 @@
   - [机械臂坐标系](#机械臂坐标系)
     - [2D 手眼标定](#2d-手眼标定)
   - [故障排查](#故障排查)
-    - [gs\_usb 内核模块未加载](#gs_usb-内核模块未加载)
+    - [gs_usb 内核模块未加载](#gs_usb-内核模块未加载)
     - [CAN 发送失败 / Message NOT sent](#can-发送失败--message-not-sent)
     - [机械臂不响应运动指令](#机械臂不响应运动指令)
     - [相机无画面](#相机无画面)
@@ -65,13 +66,14 @@
 
 ## 硬件依赖
 
-| 设备 | 说明 |
-|------|------|
-| Piper 机械臂 | 通过 USB-CAN 适配器连接，CAN 总线通信 |
-| Orbbec 深度相机 | 通过 USB 连接，作为俯视（above）相机，用于目标检测与视觉反馈 |
-| Intel RealSense 相机（可选） | 作为腕部（wrist）相机，用于双视角 VLA 数据采集与推理 |
-| USB-CAN 适配器 | 连接机械臂与主机 |
-| Jetson Orin / 任意 Linux 主机 | 运行控制程序 |
+| 设备                          | 说明                                                                                            |
+| ----------------------------- | ----------------------------------------------------------------------------------------------- |
+| Piper 机械臂                  | 通过 USB-CAN 适配器连接，CAN 总线通信                                                           |
+| JAKA Mini 机械臂（可选）      | 以太网连接控制器（`arm_port` 填控制器 IP），SDK 已附带在 `arm/jaka_sdk/`，搭配 TG-9801 触觉夹爪 |
+| Orbbec 深度相机               | 通过 USB 连接，作为俯视（above）相机，用于目标检测与视觉反馈                                    |
+| Intel RealSense 相机（可选）  | 作为腕部（wrist）相机，用于双视角 VLA 数据采集与推理                                            |
+| USB-CAN 适配器                | 连接机械臂与主机                                                                                |
+| Jetson Orin / 任意 Linux 主机 | 运行控制程序                                                                                    |
 
 > **相机说明**：数据采集与推理默认使用双相机——Orbbec Gemini 作为俯视相机（`observation/image`），Intel RealSense 作为腕部相机（`observation/wrist_image`）。若只做单相机场景（LLM 抓取、象棋等），仅需 Orbbec 相机。
 
@@ -113,7 +115,7 @@ uv --version   # 应 >= 0.5.0
 
 ```bash
 # 克隆本仓库
-git clone git@github.com:cloud666666666/AIIT-Roboarm.git 
+git clone git@github.com:cloud666666666/AIIT-Roboarm.git
 cd ~/roboarm
 
 # 克隆 LeRobot 依赖（我们修改过的版本，与 roboarm 同级或任意位置）
@@ -204,6 +206,39 @@ uv run python arm/piper_ctrl_by_sdk.py
 
 机械臂应能进行使能并执行测试运动。
 
+### 6. 使用 JAKA 机械臂（可选）
+
+JAKA Mini 通过以太网连接控制器，**无需 CAN 配置**；JAKA SDK（jkrc）已随仓库附带在 `arm/jaka_sdk/`，无需额外安装。
+
+JAKA 场景不依赖 lerobot / piper-sdk，可跳过上文的 uv 环境搭建和 lerobot 软链接，用精简依赖独立部署（Python 3.10）：
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate          # Linux 为 source .venv/bin/activate
+pip install -r requirements-jaka.txt
+```
+
+1. 在 `config.yaml` 中设置：
+
+```yaml
+arm_type: jaka
+arm_port: 10.5.5.100 # JAKA 控制器 IP
+```
+
+2. 连通性与运动验证（读状态 → 小幅关节运动 → 夹爪开合 → 复位断开），激活 venv 后在项目根目录运行：
+
+```bash
+python arm/jaka_ctrl_by_sdk.py
+```
+
+3. 辅助工具脚本位于 `tools/` 目录，在项目根目录运行：
+
+| 脚本                           | 用途                                                                     |
+| ------------------------------ | ------------------------------------------------------------------------ |
+| `tools/jaka_estop_recover.py`  | 急停释放后复位：清错误 → 上电 → 使能 → 人工确认后慢速回 Home             |
+| `tools/jaka_pick_place_pos.py` | 拖动机械臂采样放置点，输出可直接粘贴进 `config.yaml` 的 `place_pos` 片段 |
+| `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约）                     |
+
 ---
 
 ## 配置说明
@@ -215,41 +250,41 @@ uv run python arm/piper_ctrl_by_sdk.py
 #### 机械臂连接
 
 ```yaml
-arm_port: can4          # Piper 为 can*，Lerobo 为 COM*
-arm_type: piper         # piper 或 lerobo
-arm_offset: [0, -30, -40, -50, 0]  # 关节零位偏移，单位度
-arm_move_speed: 50      # 运动速度百分比 1-100，值越小越慢越平稳
-arm_reach_mse_threshold_deg2: 1.0  # 到位判定阈值（关节角均方误差，单位平方度）
-get_arm_angles_retry_times: 3      # 读取舵机角度的重试次数
+arm_port: can4 # Piper 为 can*，Lerobo 为 COM*，JAKA 为控制器 IP（如 10.5.5.100）
+arm_type: piper # piper、lerobo 或 jaka
+arm_offset: [0, -30, -40, -50, 0] # 关节零位偏移，单位度
+arm_move_speed: 50 # 运动速度百分比 1-100，值越小越慢越平稳
+arm_reach_mse_threshold_deg2: 1.0 # 到位判定阈值（关节角均方误差，单位平方度）
+get_arm_angles_retry_times: 3 # 读取舵机角度的重试次数
 ```
 
 #### 相机
 
 ```yaml
-camera_ip: ""           # 留空使用本地 Orbbec 相机；填写 IP 则使用远程相机
-camera_port: 8084       # 远程相机端口
+camera_ip: "" # 留空使用本地 Orbbec 相机；填写 IP 则使用远程相机
+camera_port: 8084 # 远程相机端口
 cv2_headless_port: 8079 # Web 显示端口（无显示器环境），留空则使用 OpenCV 窗口
 ```
 
 #### 桌面高度
 
 ```yaml
-default_desktop_height: 0.135  # 机械臂坐标系下桌面 Z 坐标，单位米
+default_desktop_height: 0.135 # 机械臂坐标系下桌面 Z 坐标，单位米
 ```
 
 #### 物品分类 / YOLO 检测
 
 ```yaml
 classification_YOLO_model_path:
-  - /home/czn/roboarm/object_detect/runs/best.pt  # YOLO OBB 模型路径
-default_conf_thres: 0.5     # 检测置信度阈值
-default_gripper_close_threshold: 0.05  # 夹爪闭合阈值
+  - /home/czn/roboarm/object_detect/runs/best.pt # YOLO OBB 模型路径
+default_conf_thres: 0.5 # 检测置信度阈值
+default_gripper_close_threshold: 0.05 # 夹爪闭合阈值
 
 # 各类别抓取与放置配置
 class_pos:
-  default:                  # 默认配置（匹配不到的类别使用此项）
-    pos: [0.05, 0.45]       # 放置位置 (x, y)，单位米
-    random_pos:             # auto-reset 随机撒回范围 [[x_min,x_max],[y_min,y_max]]
+  default: # 默认配置（匹配不到的类别使用此项）
+    pos: [0.05, 0.45] # 放置位置 (x, y)，单位米
+    random_pos: # auto-reset 随机撒回范围 [[x_min,x_max],[y_min,y_max]]
       - [0.0, 0.5]
       - [-0.2, 0.3]
   potato:
@@ -274,20 +309,20 @@ class_pos:
 > 以下参数（含上方 `class_pos.*.random_pos`）仅供全自动复位脚本 `record_and_auto_reset.py` 使用。该全自动方案实测行不通，实际采集用[半自动方案](#半自动采集数据)（人工摆放物体），这些参数可忽略。
 
 ```yaml
-workspace_x_range: [-0.1, 0.55]   # 工作空间 X 范围，超出会拒绝
-workspace_y_range: [-0.3, 0.55]   # 工作空间 Y 范围
-reset_min_place_dist_m: 0.20      # 随机放置时离已有物体的最小距离
-reset_max_objects_per_cycle: 1    # 每轮最多撒回物体数
+workspace_x_range: [-0.1, 0.55] # 工作空间 X 范围，超出会拒绝
+workspace_y_range: [-0.3, 0.55] # 工作空间 Y 范围
+reset_min_place_dist_m: 0.20 # 随机放置时离已有物体的最小距离
+reset_max_objects_per_cycle: 1 # 每轮最多撒回物体数
 ```
 
 #### 抓取动作参数
 
 ```yaml
-catch_raise_height: 0.1   # 抓取前抬起高度，单位米
-place_raise_height: 0.1   # 放置前抬起高度，单位米
-catch_time_interval_s: 0.5 # 抓取动作间停顿，单位秒
-catch_offset: 0.00         # 夹爪前向偏移，单位米
-go_down_before_open_gripper_in_place: true  # 放置时先下降再松爪
+catch_raise_height: 0.1 # 抓取前抬起高度，单位米
+place_raise_height: 0.1 # 放置前抬起高度，单位米
+catch_time_interval_s: 0.7 # 抓取动作间停顿，单位秒
+catch_offset: 0.00 # 夹爪前向偏移，单位米
+go_down_before_open_gripper_in_place: true # 放置时先下降再松爪
 ```
 
 ### YOLO 模型准备
@@ -326,11 +361,11 @@ uv run python arm/calibrate_handeye_2d.py --mode test
 
 标定要点：
 
+- 标定脚本启动时机械臂会先自动移动到便于拖动的起始姿态（Piper 回 Home 位，JAKA 移到工作区上方），运行前请确保运动路径无障碍
+- 进入采点后的拖动方式因臂型而异：Piper 松开力矩后可直接徒手拖拽；**JAKA 保持使能状态，需按住末端 free 按钮拖拽**（按住=拖动、松开=锁定）
 - 相机与机械臂的相对位置一旦改变，必须重新标定
 - 标定时机械臂末端和点击点应尽量落在同一桌面高度平面（`default_desktop_height`）
 - 采点尽量覆盖整个工作空间，避免全部集中在一小块区域
-
-
 
 ---
 
@@ -449,11 +484,11 @@ uv run python classification/catch_with_arm_record_piper.py
 
 ### 键盘控制
 
-| 按键 | 功能 |
-|------|------|
+| 按键                | 功能                                                             |
+| ------------------- | ---------------------------------------------------------------- |
 | `n` / `→`（右箭头） | 结束当前 episode，保存数据；在复位阶段则表示"已摆好，进入下一轮" |
-| `r` / `←`（左箭头） | 丢弃当前 episode（不保存），重新录制 |
-| `q` / `Esc` | 停止采集，保存当前数据后退出 |
+| `r` / `←`（左箭头） | 丢弃当前 episode（不保存），重新录制                             |
+| `q` / `Esc`         | 停止采集，保存当前数据后退出                                     |
 
 > **复位交互**：一个 episode 录完后，画面会显示 `RESET - Press Right arrow when ready`。此时人工把抓取物体重新摆到合适位置，摆好后按 `n` / 右箭头即开始下一轮录制。
 
@@ -488,12 +523,12 @@ cv2_headless_port: 8079
 
 推理客户端的观测/动作格式与训练录制器 `catch_with_arm_record_piper.py` **严格一致**：
 
-| 字段 | 含义 |
-|------|------|
-| `observation/state` | `[joint_1..6 (deg), gripper_0to1 * 100]`，7 维 |
-| `action` | 同 state 的 7 维空间（绝对关节角度 + 夹爪 * 100） |
-| `observation/image` | 俯视相机（Orbbec），RGB HxWx3 |
-| `observation/wrist_image` | 腕部相机（Intel RealSense），RGB HxWx3 |
+| 字段                      | 含义                                               |
+| ------------------------- | -------------------------------------------------- |
+| `observation/state`       | `[joint_1..6 (deg), gripper_0to1 * 100]`，7 维     |
+| `action`                  | 同 state 的 7 维空间（绝对关节角度 + 夹爪 \* 100） |
+| `observation/image`       | 俯视相机（Orbbec），RGB HxWx3                      |
+| `observation/wrist_image` | 腕部相机（Intel RealSense），RGB HxWx3             |
 
 ### 运行步骤
 
@@ -526,14 +561,14 @@ cv2_headless_port: 8079
 
 ### 关键参数
 
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--host` / `--port` | `10.0.105.11` / `8002` | 策略服务器地址 |
-| `--prompt` | pick the carrot ... | 任务指令，需与训练时的措辞风格一致 |
-| `--actions_per_chunk` | 10 | 每次推理执行的动作步数，越小闭环越紧（网络往返更多） |
-| `--control_dt` | 0.033 | 相邻动作下发间隔（≈ 1/30s，与训练帧率对齐） |
-| `--move_speed` | 100 | 启动归零 / 控制模式速度百分比 |
-| `--dry_run` | False | 只记录动作不驱动机械臂，首次运行务必先开启 |
+| 参数                  | 默认                   | 说明                                                 |
+| --------------------- | ---------------------- | ---------------------------------------------------- |
+| `--host` / `--port`   | `10.0.105.11` / `8002` | 策略服务器地址                                       |
+| `--prompt`            | pick the carrot ...    | 任务指令，需与训练时的措辞风格一致                   |
+| `--actions_per_chunk` | 10                     | 每次推理执行的动作步数，越小闭环越紧（网络往返更多） |
+| `--control_dt`        | 0.033                  | 相邻动作下发间隔（≈ 1/30s，与训练帧率对齐）          |
+| `--move_speed`        | 100                    | 启动归零 / 控制模式速度百分比                        |
+| `--dry_run`           | False                  | 只记录动作不驱动机械臂，首次运行务必先开启           |
 
 > **安全提示**：首次部署或更换权重后，务必先用 `--dry_run` 确认动作合理，并适当降低 `--move_speed`，再进行真机运动。推理时机械臂会以接近开环方式执行模型输出的密集轨迹，请确保工作空间内无人无障碍。
 
@@ -547,14 +582,14 @@ cv2_headless_port: 8079
 
 #### VLM 识别与抓取代码路径
 
-| 路径 | 作用 |
-|------|------|
+| 路径                  | 作用                                                                        |
+| --------------------- | --------------------------------------------------------------------------- |
 | `llm/catch_by_llm.py` | 主入口；读取相机画面和文字/语音指令，调用 VLM，并执行抓取、放置和成功率统计 |
-| `llm/llm_detect.py` | 图像编码、相机方向修正、VLM 检测请求及检测结果聚合 |
-| `llm/llm_api.py` | OpenAI 兼容多模态接口客户端，读取模型地址、模型名和提示词配置 |
-| `prompts.toml` | `user_instruction_prompt` 等 VLM 提示词模板 |
-| `arm/arm_base.py` | 像素坐标转换、夹爪角度计算以及 `catch_and_place()` 抓放动作 |
-| `llm/fine_tuing/` | VLM 数据标注、微调、LoRA 合并、部署和评测脚本；详见该目录下的 `README.md` |
+| `llm/llm_detect.py`   | 图像编码、相机方向修正、VLM 检测请求及检测结果聚合                          |
+| `llm/llm_api.py`      | OpenAI 兼容多模态接口客户端，读取模型地址、模型名和提示词配置               |
+| `prompts.toml`        | `user_instruction_prompt` 等 VLM 提示词模板                                 |
+| `arm/arm_base.py`     | 像素坐标转换、夹爪角度计算以及 `catch_and_place()` 抓放动作                 |
+| `llm/fine_tuing/`     | VLM 数据标注、微调、LoRA 合并、部署和评测脚本；详见该目录下的 `README.md`   |
 
 调用链如下：
 
@@ -574,7 +609,7 @@ llm/catch_by_llm.py
 ```yaml
 # OpenAI 兼容的 VLM 服务
 llm_base_url: http://<VLM服务IP>:<端口>/v1
-llm_api_key: any                  # 本地服务也不能留空
+llm_api_key: any # 本地服务也不能留空
 llm_model: output/merged-qwen3.5-9b-graspdet
 prompts_file: prompts.toml
 
@@ -730,7 +765,8 @@ sudo ip link set "$CAN_IF" up
 
 ```
 roboarm/
-  arm/              # 机械臂控制（Piper + Lerobo），手眼标定
+  arm/              # 机械臂控制（Piper / Lerobo / JAKA），手眼标定；jaka_sdk/ 为 JAKA 官方 SDK
+  tools/            # 独立工具脚本（JAKA 急停恢复、放置点采样、夹爪验证）
   camera/           # Orbbec 深度相机 + USB 相机控制
   classification/   # YOLO 自动抓取 + 数据采集流水线 + VLA 推理客户端(main.py)
   object_detect/    # YOLO OBB 模型训练与检测
