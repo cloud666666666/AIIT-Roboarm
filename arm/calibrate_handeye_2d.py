@@ -185,6 +185,7 @@ def collect_image_pose(image_points_path, end_poses_path):
     set_mouse_callback(window_name, mouse_callback)
 
     arm = Arm()
+    arm.prepare_for_manual_teach()
     arm.disable_torque()
     cam = Camera(color=True, depth=False, undistort=True)
     while True:
@@ -234,6 +235,8 @@ def collect_image_pose(image_points_path, end_poses_path):
         except KeyboardInterrupt:
             break
     destroy_all_windows()
+    cam.close()
+    arm.disconnect_arm()
 
     np.save(image_points_path, np.array(image_points, dtype=np.float32))
     np.save(end_poses_path, np.array(end_poses, dtype=np.float32))
@@ -371,6 +374,7 @@ def collect_board_correspondences(
     window_name = "Camera"
 
     arm = Arm()
+    arm.prepare_for_manual_teach()
     arm.disable_torque()
     cam = Camera(color=True, depth=False, undistort=True)
 
