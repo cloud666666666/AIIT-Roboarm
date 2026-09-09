@@ -1,0 +1,48 @@
+# roboarm JAKA 场景依赖清单（从实测 Windows 环境导出，Python 3.10）
+# 覆盖：JAKA 机械臂(jkrc 本地 SDK 无需安装) + TG-9801 夹爪 + Orbbec 相机 + YOLO 检测抓取 + Web 无头显示
+# 安装：python -m venv .venv && .venv\Scripts\activate && pip install -r requirements-jaka.txt
+# 说明：不含 lerobot / piper-sdk / python-can 等 Piper 与 VLA 场景依赖，完整环境请参考 README 用 uv sync
+
+blinker==1.9.0
+certifi==2026.7.22
+charset-normalizer==3.5.1
+click==8.5.0
+cloudpickle==3.1.2
+contourpy==1.3.2
+cycler==0.12.1
+filelock==3.32.5
+flask==3.1.3
+fonttools==4.64.0
+fsspec==2026.7.0
+idna==3.19
+itsdangerous==2.2.0
+jinja2==3.1.6
+kiwisolver==1.5.1
+markupsafe==3.0.3
+matplotlib==3.10.9
+mpmath==1.3.0
+networkx==3.4.2
+numpy==2.2.6
+nvidia-ml-py==13.610.43
+opencv-python==5.0.0.93
+packaging==26.3
+pillow==12.3.0
+polars==1.44.1
+polars-runtime-32==1.44.1
+psutil==7.2.2
+pyorbbecsdk2==2.0.18
+pyparsing==3.3.2
+python-dateutil==2.9.0.post0
+pyyaml==6.0.3
+requests==2.34.2
+scipy==1.15.3
+setuptools==84.0.0
+six==1.17.0
+sympy==1.14.0
+torch==2.14.0
+torchvision==0.29.0
+typing-extensions==4.16.0
+ultralytics==8.4.143
+ultralytics-thop==2.1.6
+urllib3==2.7.0
+werkzeug==3.1.8

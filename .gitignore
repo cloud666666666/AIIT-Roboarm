@@ -18,6 +18,7 @@ recordings/
 logs/
 
 *.txt
+!requirements-jaka.txt
 .env
 .venv/
 push_dataset_ms.py
