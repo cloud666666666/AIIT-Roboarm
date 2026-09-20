@@ -8,6 +8,7 @@ from typing import cast
 import cv2
 import numpy as np
 from utils.config_getter import get_config_value
+from utils.throttled_print import throttled_print
 from scipy.spatial.transform import Rotation as R
 from typing_extensions import Self
 from collections.abc import Callable
@@ -325,7 +326,9 @@ class Arm:
             step_callback=step_callback,
         )
         if not res:
-            print("移动到目标位置上方失败，取消抓取")
+            throttled_print(
+                "catch_move_above_failed", "移动到目标位置上方失败，取消抓取"
+            )
             self.move_to_home(gripper_open_0to1=1)
             return False
         time.sleep(self.catch_time_interval_s * 2)
@@ -337,7 +340,7 @@ class Arm:
             step_callback=step_callback,
         )
         if not res:
-            print("移动到目标位置失败，取消抓取")
+            throttled_print("catch_move_failed", "移动到目标位置失败，取消抓取")
             self.move_to_home(gripper_open_0to1=1)
             return False
         time.sleep(self.catch_time_interval_s)
@@ -351,7 +354,7 @@ class Arm:
             step_callback=step_callback,
         )
         if not res:
-            print("抬起失败，取消抓取")
+            throttled_print("catch_lift_failed", "抬起失败，取消抓取")
             self.move_to_home(gripper_open_0to1=1)
             return False
         time.sleep(self.catch_time_interval_s)
@@ -362,7 +365,7 @@ class Arm:
             current_gripper_open_0to1 is None
             or current_gripper_open_0to1 < self.default_gripper_close_threshold
         ):
-            print("夹取失败")
+            throttled_print("catch_grip_failed", "夹取失败")
             self.move_to_home(gripper_open_0to1=1)
             return False
         return True

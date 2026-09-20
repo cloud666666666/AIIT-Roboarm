@@ -11,7 +11,8 @@ from camera.camera_api import Camera
 from utils.cv2_display import show_image, poll_key, destroy_all_windows
 
 def detect_objects_in_frame(model, frame, conf_thres=0.8, iou_thres=0.45):
-    results = model(frame, conf=conf_thres, iou=iou_thres)[0]
+    # verbose=False 关闭 ultralytics 每帧打印的检测摘要与耗时，避免刷屏
+    results = model(frame, conf=conf_thres, iou=iou_thres, verbose=False)[0]
     detections = results.obb.xywhr.cpu().numpy()  # xywhr format
     scores = results.obb.conf.cpu().numpy()
     class_ids = results.obb.cls.cpu().numpy().astype(int)

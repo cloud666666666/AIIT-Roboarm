@@ -1,4 +1,5 @@
 import atexit
+import logging
 import os
 import queue
 import threading
@@ -43,6 +44,11 @@ def _headless_index_html() -> str:
 
 def _run_headless_server() -> None:
     app = Flask(__name__)
+
+    # 浏览器端每个鼠标事件都会 POST 一次，werkzeug 的逐请求访问日志会
+    # 刷屏；屏蔽 INFO 级日志（含启动横幅），就绪地址由
+    # _ensure_headless_server 自行打印，错误仍会输出。
+    logging.getLogger("werkzeug").setLevel(logging.ERROR)
 
     @app.get("/")
     def index():
