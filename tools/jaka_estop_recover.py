@@ -32,12 +32,34 @@ def main():
     # 急停后通常整体断电；若已上电，重复调用无副作用（仅返回非 0 错误码）
     print("上电...")
     ret = robot.power_on()
-    print(f"power_on 返回码: {ret[0]}")
+    while ret[0] != 0:
+        print(f"power_on 返回码: {ret[0]}（非 0）")
+        ans = input(
+            "请检查急停按钮是否已释放（旋钮顺时针拔起），"
+            "释放后按回车重试；确认急停已释放则输入 s 跳过: "
+        )
+        if ans.strip().lower() == "s":
+            break
+        robot.clear_error()
+        time.sleep(1)
+        print("重试上电...")
+        ret = robot.power_on()
     time.sleep(1)
 
     print("使能...")
     ret = robot.enable_robot()
-    print(f"enable_robot 返回码: {ret[0]}")
+    while ret[0] != 0:
+        print(f"enable_robot 返回码: {ret[0]}（非 0）")
+        ans = input(
+            "请确认急停已释放、上电已成功，"
+            "处理后按回车重试；确认无问题则输入 s 跳过: "
+        )
+        if ans.strip().lower() == "s":
+            break
+        robot.clear_error()
+        time.sleep(1)
+        print("重试使能...")
+        ret = robot.enable_robot()
     time.sleep(1)
 
     input("\n确认机械臂回 Home 路径无障碍后按回车（将慢速回零位）...")
