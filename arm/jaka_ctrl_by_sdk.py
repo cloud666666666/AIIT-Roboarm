@@ -16,6 +16,7 @@ from collections.abc import Sequence
 from arm.arm_base import Arm, StepCallback
 from arm.jaka_gripper import JakaGripper
 from utils.config_getter import get_config_value
+from utils.throttled_print import throttled_print
 import time
 import numpy as np
 import jkrc
@@ -85,6 +86,11 @@ class JakaBySDK(Arm):
                 "arm_move_speed", 100, raise_if_missing=False
             )
         self.move_speed = max(min(int(move_speed), 100), 1)
+        # 抓取旋转角相对夹爪实际朝向的标定偏移（度），见 config
+        # `jaka_catch_rot_offset_deg` 注释。
+        self.catch_rot_offset_deg = float(
+            get_config_value("jaka_catch_rot_offset_deg", 0, raise_if_missing=False)
+        )
         # 基准超时（100% 速度时的超时秒数），与 PiperBySDK 语义一致，
         # 录制等场景可直接改 self.timeout_base_s 覆盖默认值。
         self.timeout_base_s = 10 if debug_mode else 5
@@ -120,10 +126,10 @@ class JakaBySDK(Arm):
             and 0 <= close_pos <= 1000
         )
         if not endpoints_valid:
-            print(
-                f"Warning: TG-9801 行程读取异常 (close={close_pos}, "
-                f"open={open_pos})，回退本机实测行程 close=1000/open=0"
-            )
+            # print(
+            #     f"Warning: TG-9801 行程读取异常 (close={close_pos}, "
+            #     f"open={open_pos})，回退本机实测行程 close=1000/open=0"
+            # )
             self.gripper_open_pos = 0
             self.gripper_close_pos = 1000
         else:
@@ -364,7 +370,7 @@ class JakaBySDK(Arm):
         else:
             target_euler = list(self.DEFAULT_DOWN_EULER_DEG_ZYX)
             if rot_rad is not None:
-                target_euler[0] = np.degrees(rot_rad)
+                target_euler[0] = np.degrees(rot_rad) + self.catch_rot_offset_deg
         rpy_rad = R.from_euler("zyx", target_euler, degrees=True).as_euler("xyz")
         pose_mm = [pos[0] * 1000, pos[1] * 1000, pos[2] * 1000, *rpy_rad]
 
@@ -393,13 +399,17 @@ class JakaBySDK(Arm):
             ret = self.robot.linear_move(pose_mm, ABS, True, speed_mm_s)
             if ret[0] == 0:
                 return True
-            print(f"直线运动失败（错误码 {ret[0]}），退回关节路径")
+            throttled_print(
+                "linear_move_failed",
+                f"直线运动失败（错误码 {ret[0]}），退回关节路径",
+            )
 
         angles_deg = self._solve_ik_deg(pose_mm, current_angles_deg)
         if angles_deg is None:
-            print(
+            throttled_print(
+                "ik_no_solution",
                 "无可执行的逆解（所有支均超关节限位），"
-                f"目标位姿(mm, rpy): {[round(v, 2) for v in pose_mm]}"
+                f"目标位姿(mm, rpy): {[round(v, 2) for v in pose_mm]}",
             )
             return False
         return self.set_arm_angles(

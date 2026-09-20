@@ -18,6 +18,7 @@ import time
 import concurrent.futures
 import copy
 from utils.cv2_display import show_image, poll_key, destroy_all_windows
+from utils.throttled_print import throttled_print
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,7 +108,10 @@ def main(target_class: str = None):
                     )
                     class_place_pos = copy.deepcopy(place_pos.get(class_name, None))
                     if class_place_pos is None or "pos" not in class_place_pos:
-                        print("No placement location specified, place in origin.")
+                        throttled_print(
+                            "no_place_pos",
+                            "No placement location specified, place in origin.",
+                        )
                         class_place_pos = {"pos": [target_x, target_y]}
                     else:
                         match class_place_pos["pos"][0]:
@@ -135,10 +139,17 @@ def main(target_class: str = None):
                         )
                         < place_distance_threshold
                     ):
-                        print(
-                            f"Object {class_name} is too close to place position, skipping catch."
+                        throttled_print(
+                            f"place_too_close_{class_name}",
+                            f"Object {class_name} is too close to place position, skipping catch.",
                         )
                     else:
+                        throttled_print(
+                            f"catch_{class_name}_{target_x:.1f}_{target_y:.1f}",
+                            f"[{class_name}] 抓取坐标: ({target_x:.3f}, {target_y:.3f})，"
+                            f"放置坐标: ({class_place_pos['pos'][0]:.3f}, "
+                            f"{class_place_pos['pos'][1]:.3f})",
+                        )
                         future = executor.submit(
                             arm.catch_and_place,
                             # 夹爪向外偏移一些，避免刚好顶到物体

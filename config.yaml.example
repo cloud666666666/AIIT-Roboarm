@@ -17,6 +17,12 @@ arm_move_speed: 50
 # 关节角向量允许的均方误差阈值，小于该值认为到达目标点，单位平方度
 arm_reach_mse_threshold_deg2: 1.0
 
+# JAKA 抓取旋转角的标定偏移，单位度，仅 jaka_ctrl_by_sdk 读取，其他机械臂忽略。
+# gripper_angle_by_longer 按检测框长边算出的抓取角与 JAKA 夹爪实际朝向存在
+# 固定偏差（夹爪安装朝向与 Piper 不同），在 jaka_ctrl_by_sdk 的 move_to 中
+# 对 rot_rad 加上该偏移补偿；实机方向不对时改为 -90，默认无偏移可置 0。
+jaka_catch_rot_offset_deg: 90
+
 # 不用远程摄像头则置空
 camera_ip:
 camera_port: 8084
