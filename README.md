@@ -81,6 +81,8 @@
 
 ## 环境搭建（从零开始）
 
+> **JAKA 机械臂用户请勿按本节步骤顺序配置**：以下步骤 1–5（系统依赖、uv、lerobot 软链接、CAN 配置）都是为 Piper 机械臂准备的。使用 JAKA 请直接跳到 [6. 使用 JAKA 机械臂（可选）](#6-使用-jaka-机械臂可选) 进行环境配置（精简依赖独立部署，无需 uv / lerobot / CAN）。
+
 ### 1. 系统依赖
 
 ```bash
@@ -88,7 +90,7 @@ sudo apt update
 sudo apt install -y can-utils ethtool build-essential
 ```
 
-**Jetson 上额外需要 gs_usb 内核模块**（USB-CAN 通信必需）：
+**Jetson 上额外需要 gs_usb 内核模块**（Piper 机械臂 USB-CAN 通信必需；JAKA 走以太网，不需要）：
 
 先检查是否已加载：
 
@@ -97,6 +99,12 @@ lsmod | grep gs_usb
 ```
 
 如果没有输出，说明内核未启用 `gs_usb`，需要编译安装。详见文末 [故障排查 / gs_usb 内核模块](#gs_usb-内核模块未加载)。
+
+**Orbbec 相机需要安装 udev 规则**（使用本地相机必需；克隆仓库后执行，否则 SDK 无权限打开 USB 设备，报错 `usbEnumerator openUsbDevice failed!`）：
+
+```bash
+sudo sh camera/scripts/install_udev_rules.sh
+```
 
 ### 2. 安装 uv
 
@@ -751,7 +759,7 @@ sudo ip link set "$CAN_IF" up
 
 - 确认 Orbbec 相机 USB 已连接
 - 确认 `camera_ip` 为空（使用本地相机）或填写了正确的远程相机 IP
-- 检查 udev 规则是否已安装：`camera/scripts/` 中有 Orbbec 设备的 udev 配置文件
+- 若报错 `RuntimeError: usbEnumerator openUsbDevice failed!`，说明 Orbbec 相机的 udev 规则未安装（SDK 无权限打开 USB 设备）：执行 `sudo sh camera/scripts/install_udev_rules.sh`（见 [环境搭建](#环境搭建从零开始)）后重试；若权限仍无变化，重新插拔相机
 
 ### 报错「没有手眼标定数据，无法转换图像坐标」
 
