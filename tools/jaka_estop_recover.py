@@ -5,10 +5,8 @@ import os
 import time
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-_JAKA_SDK_DIR = os.path.join(
-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "arm", "jaka_sdk"
-)
-sys.path.insert(0, _JAKA_SDK_DIR)
+
+import arm.jaka_sdk  # noqa: F401  按平台注入 jkrc SDK 路径并预加载依赖库
 
 import jkrc
 from utils.config_getter import get_config_value

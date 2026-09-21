@@ -4,12 +4,9 @@ import os
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# jkrc SDK 二进制（Windows: jkrc.pyd + jakaAPI.dll；Linux: jkrc.so + libjakaAPI.so）
-# 放在 arm/jaka_sdk/ 目录下，导入前注入 sys.path。
-_JAKA_SDK_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "jaka_sdk")
-sys.path.insert(0, _JAKA_SDK_DIR)
-if os.name == "nt":
-    os.add_dll_directory(_JAKA_SDK_DIR)
+# jkrc SDK 二进制按平台自动选择（arm/jaka_sdk/windows|aarch64-linux-gnu|x86_64-linux-gnu），
+# 导入即注入 sys.path 并预加载依赖库，见 arm/jaka_sdk/__init__.py。
+import arm.jaka_sdk  # noqa: F401
 
 from typing import Union, List
 from collections.abc import Sequence
