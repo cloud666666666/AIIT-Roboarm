@@ -19,6 +19,13 @@ JakaGripper：经 JAKA 末端 RS485L 控制 HKV TG-9801 夹爪（独立 SDK，�
 
 读策略：核心状态（state/position/current/hardness/action/adaptive_speed）常驻 6 个信号量，
 其余低频接口按需临时读（等 1s 让控制器完成首次轮询）。
+信号量生命周期铁律（实测）：
+  · 上电前注册会污染控制器信号量表（名字腐蚀成 '\\x01'，槽位卡死，不可逆）；
+  · 上电周期会把表中既有条目随机打乱（名字腐蚀/地址错乱/槽位冻结）；
+  · 表容量上限约 8 条，超出静默丢弃；
+  · 控制器固件重建表时有竞态：「删光→重加」随机成功或错乱，因此
+    power_on 上电后跑「删光→重加→物理验证」自愈循环，直至 position
+    槽位真实跟踪开合；其余时间对表只读不写。
 
 依赖：仅 `import jkrc`（JAKA SDK，jkrc.pyd/jkrc.so 需在 sys.path 可导入）。
       CRC16 已内联，不再依赖 hkv_tg9801 示例 SDK。
@@ -89,6 +96,7 @@ class JakaGripper:
         self.slave_id = slave_id
         self.baudrate = baudrate
         self._shared_robot = robot is not None
+        self._signals_added = False
         if self._shared_robot:
             self.robot = robot
         else:
@@ -97,8 +105,8 @@ class JakaGripper:
             if ret[0] != 0:
                 raise ConnectionError(f"login 失败: {ret}")
         self._config_channel()
-        self._clear_signals()
-        self._add_core()
+        # 不碰信号量表：上电前注册会污染表（名字腐蚀成 '\x01'、槽位卡死），
+        # 核心信号量统一由 power_on() 上电后按需追加。
 
     def _config_channel(self) -> None:
         """配置末端 RS485L 通道为 Modbus RTU 主站模式。
@@ -118,22 +126,18 @@ class JakaGripper:
             self.robot.logout()
 
     def power_on(self) -> None:
-        """机械臂上电（末端 RS485 接口与夹爪供电依赖上电才通信）。"""
+        """机械臂上电（末端 RS485 接口与夹爪供电依赖上电才通信）。
+
+        上电后执行信号量表自愈验证（见 _heal_signals），验证通过即就绪。
+        """
         self.robot.power_on()
         time.sleep(2)
         # 上电会复位 RS485 通道配置，必须先重新配置才能通信
         self._config_channel()
-        # 上电后重新加核心信号量（上电前加的信号量首次轮询时夹爪没电，会卡在 0）
-        self._clear_signals()
-        self._add_core()
-        # 等夹爪就绪：就绪后会有待机电流(current 非 0)，最多等 15s
-        for _ in range(15):
-            time.sleep(1)
-            cur = self._read_core("current")
-            if cur is not None and cur != 0:
-                return
-        print("Warning: 夹爪 15s 内未就绪（电流一直为 0），"
-              "请检查 RS485 接线与通道配置")
+        self._signals_added = True
+        if not self._heal_signals():
+            print("Warning: 夹爪信号量表多次重建仍无法正确轮询，"
+                  "请检查 RS485 接线与通道配置（必要时重启控制器）")
 
     def power_off(self) -> None:
         """机械臂下电。"""
@@ -155,53 +159,101 @@ class JakaGripper:
         return self._send(p)
 
     # ---------- 读：信号量 ----------
-    def _clear_signals(self) -> None:
+    def _signals(self) -> list:
         info = self.robot.get_rs485_signal_info()
-        if info[0] == 0:
-            for s in info[1]:
-                try:
-                    self.robot.del_tio_rs_signal(s["sig_name"])
-                except Exception:
-                    pass
+        return list(info[1]) if info and info[0] == 0 else []
+
+    def _has_slot(self, addr: int, sig_type: int = SIG_HOLDING) -> bool:
+        return any(
+            s.get("sig_addr") == addr and s.get("sig_type", SIG_HOLDING) == sig_type
+            for s in self._signals()
+        )
+
+    def _read_at(self, addr: int, sig_type: int = SIG_HOLDING):
+        """按地址取轮询值（不按名字——名字可能被控制器腐蚀）。"""
+        for s in self._signals():
+            if s.get("sig_addr") == addr and s.get("sig_type", SIG_HOLDING) == sig_type:
+                return s.get("value")
+        return None
+
+    def _clear_signals(self) -> None:
+        """删除表中全部信号量。仅 power_on 上电后使用，删除后必须立刻
+        重新追加核心信号量（删除/重加本身会打乱映射，成对执行才安全）。"""
+        for s in self._signals():
+            try:
+                self.robot.del_tio_rs_signal(s["sig_name"])
+            except Exception:
+                pass
 
     def _add_signal(self, name: str, addr: int, sig_type: int = SIG_HOLDING) -> None:
         self.robot.add_tio_rs_signal({
             'sig_name': name, 'chn_id': self.chn, 'sig_type': sig_type,
             'sig_addr': addr, 'value': 0, 'frequency': 5})
 
-    def _add_core(self) -> None:
+    def _ensure_signals(self) -> None:
+        """按地址追加缺失的核心信号量（表容量约 8 条，留下 2 条额度给
+        行程端点等低频 _read_tmp 追加）。
+
+        要求夹爪已上电（独立模式未走 power_on 时由首次读取触发）。
+        """
+        if self._signals_added:
+            return
+        added = False
         for name in CORE:
-            self._add_signal(name, REG[name])
-        time.sleep(1.2)  # 等控制器完成首次轮询
+            if not self._has_slot(REG[name]):
+                self._add_signal(name, REG[name])
+                added = True
+        if added:
+            time.sleep(1.2)  # 等控制器完成首次轮询
+        self._signals_added = True
+
+    def _heal_signals(self, rounds: int = 8) -> bool:
+        """删光→重加→物理验证，直至 position 槽位真实跟踪开合。
+
+        控制器固件在信号量表重建时存在竞态：同样的「删光→重加」随机
+        得到正确或错乱的「名字→轮询值」映射，且错乱可能连续多轮
+        （实测 8 轮内可收敛）。判定标准不依赖表本身：release/grip 的
+        物理动作必然执行，position 跟踪（闭−开 ≥ 800）即证明槽位健康。
+        """
+        for _ in range(rounds):
+            self._clear_signals()
+            for name in CORE:
+                self._add_signal(name, REG[name])
+            time.sleep(2.0)  # 等控制器重建轮询
+            self.release()
+            time.sleep(2.0)
+            p_open = self._read_at(REG["position"])
+            self.grip(1000)
+            time.sleep(2.5)
+            p_close = self._read_at(REG["position"])
+            if (p_open is not None and p_close is not None
+                    and p_close - p_open >= 800):
+                self.release()  # 验证结束，留张开状态
+                return True
+        self.release()
+        return False
 
     def _read_core(self, name: str):
-        info = self.robot.get_rs485_signal_info()
-        if info[0] == 0:
-            for s in info[1]:
-                if s["sig_name"] == name:
-                    return s["value"]
-        return None
+        self._ensure_signals()
+        return self._read_at(REG[name])
 
     def _read_tmp(self, addr: int, sig_type: int = SIG_HOLDING):
-        """低频接口：临时读单个寄存器（保留核心信号量）。"""
-        self.robot.del_tio_rs_signal("_tmp")
-        self._add_signal("_tmp", addr, sig_type)
-        time.sleep(1.0)
-        val = self._read_core("_tmp")
-        return val
+        """低频接口：读单个寄存器（缺槽位则追加一个持久槽位，绝不删改）。"""
+        if not self._has_slot(addr, sig_type):
+            self._add_signal(f"_tmp_{sig_type}_{addr:04X}", addr, sig_type)
+        time.sleep(1.0)  # 等控制器完成（首次）轮询
+        return self._read_at(addr, sig_type)
 
     def _read_tmp_multi(self, addr: int, count: int, sig_type: int = SIG_HOLDING) -> list:
-        """低频接口：临时读连续 count 个寄存器。"""
-        self._clear_signals()  # 腾出信号量额度
-        names = [f"_m{i}" for i in range(count)]
-        for i, n in enumerate(names):
-            self._add_signal(n, addr + i, sig_type)
-        time.sleep(1.2)
-        info = self.robot.get_rs485_signal_info()
-        vals = {s["sig_name"]: s["value"] for s in info[1]} if info[0] == 0 else {}
-        self._clear_signals()
-        self._add_core()  # 恢复核心
-        return [vals.get(n) for n in names]
+        """低频接口：读连续 count 个寄存器（追加式，绝不删改已有条目）。"""
+        added = False
+        for i in range(count):
+            if not self._has_slot(addr + i, sig_type):
+                self._add_signal(f"_m_{sig_type}_{addr + i:04X}", addr + i, sig_type)
+                added = True
+        if added:
+            time.sleep(1.2)
+        return [self._read_at(addr + i, sig_type) for i in range(count)]
 
     # ---------- 运动接口 ----------
     def grip(self, speed: int = 1000) -> int:

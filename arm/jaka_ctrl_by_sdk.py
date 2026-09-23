@@ -101,7 +101,8 @@ class JakaBySDK(Arm):
         if ret[0] != 0:
             raise ConnectionError(f"JAKA 控制器登录失败 ({arm_ip}): {ret}")
         # 夹爪共享同一条控制器连接（控制器 SDK 连接数有限）；
-        # power_on 会给整个机械臂上电并等待夹爪就绪（内部等电流非 0）。
+        # power_on 会给整个机械臂上电并执行信号量表自愈验证
+        # （删光→重加→release/grip 物理验证 position 跟踪）。
         self.gripper = JakaGripper(robot=self.robot)
         self.gripper.power_on()
         self.robot.enable_robot()
