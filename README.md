@@ -246,6 +246,14 @@ python arm/jaka_ctrl_by_sdk.py
 | `tools/jaka_estop_recover.py`  | 急停释放后复位：清错误 → 上电 → 使能 → 人工确认后慢速回 Home             |
 | `tools/jaka_pick_place_pos.py` | 拖动机械臂采样放置点，输出可直接粘贴进 `config.yaml` 的 `place_pos` 片段 |
 | `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约）                     |
+| `tools/jaka_gripper_diagnose.py` | TG-9801 读链路诊断（通道配置 → 逐寄存器读 → 物理跟踪验证）             |
+
+> **TG-9801 夹爪读接口注意**：控制器信号量表在「表里 ≥2 条」时槽位会错位
+> （读数张冠李戴/恒 0），驱动已改为「单条目 + `update_tio_rs_signal` 强制轮询」
+> 逐寄存器读，**单次约 1.3s**：`get_arm_angles()` 每次含一次夹爪位置读，
+> 高频循环（策略推理、数据录制）需注意节奏；发 `grip`/`release` 等写指令时
+> **勿并发轮询**，否则轮询流量会抢 RS485 半双工总线导致写帧丢失。
+> 读链路异常时运行 `python tools/jaka_gripper_diagnose.py` 诊断。
 
 ---
 
