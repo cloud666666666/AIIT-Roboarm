@@ -542,24 +542,19 @@ class JakaBySDK(Arm):
         相比固定 sleep 自适应：夹厚物体提前稳定即抬、空夹走满行程也
         等得了。先等位置开始变化（排除指令生效前的静止读数），再等
         连续两次变化低于阈值；超时（含读取异常）放行，保持原行为上限。
+        注：单次读约 1.3s（见 JakaGripper._read_reg），按读取节奏采样。
         """
-        poll_interval_s = 0.2
-        timeout_s = 3.0
+        timeout_s = 8.0
         stable_threshold = 5  # 位置计数（行程 0~1000）
         initial_pos = self.gripper.read_position()
         last_pos = initial_pos
         moved = False
         start = time.time()
         while time.time() - start < timeout_s:
-            time.sleep(poll_interval_s)
             pos = self.gripper.read_position()
             if pos is None:
                 continue
-            print(
-                f"[wait_gripper] t={time.time() - start:.2f}s "
-                f"pos={pos} state={self.gripper.read_state()} "
-                f"current={self.gripper.read_current()}mA"
-            )
+            print(f"[wait_gripper] t={time.time() - start:.2f}s pos={pos}")
             if not moved:
                 if abs(pos - initial_pos) > stable_threshold:
                     moved = True
