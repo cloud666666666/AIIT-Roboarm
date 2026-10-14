@@ -247,6 +247,7 @@ python arm/jaka_ctrl_by_sdk.py
 | `tools/jaka_pick_place_pos.py` | 拖动机械臂采样放置点，输出可直接粘贴进 `config.yaml` 的 `place_pos` 片段 |
 | `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约）                     |
 | `tools/jaka_gripper_diagnose.py` | TG-9801 读链路诊断（通道配置 → 逐寄存器读 → 物理跟踪验证）             |
+| `tools/jaka_hand_probe.py`     | 灵心巧手 O6 手探测与动作验证（读探测 / `--sweep` 扫波特率 / `--wiggle` 写动作+读回闭环） |
 
 > **TG-9801 夹爪读接口注意**：控制器信号量表在「表里 ≥2 条」时槽位会错位
 > （读数张冠李戴/恒 0），驱动已改为「单条目 + `update_tio_rs_signal` 强制轮询」
