@@ -1,4 +1,4 @@
-# Description: JAKA Mini 机械臂 SDK 控制实现（jkrc，TCP 连接 + TG-9801 触觉夹爪）。
+# Description: JAKA Mini 机械臂 SDK 控制实现（jkrc，TCP 连接 + TG-9801 夹爪 / O6 手，config 切换）。
 import sys
 import os
 
@@ -12,6 +12,7 @@ from typing import Union, List
 from collections.abc import Sequence
 from arm.arm_base import Arm, StepCallback
 from arm.jaka_gripper import JakaGripper
+from arm.jaka_hand import JakaHand
 from utils.config_getter import get_config_value
 from utils.throttled_print import throttled_print
 import time
@@ -32,8 +33,10 @@ class JakaBySDK(Arm):
       （如 home 的 j5=0）或直线失败时走 `kine_inverse` + 关节插值（超限支
       限位感知修复），不需要本地 URDF/kinpy；
     - 关节绝对编码，无 offset 标定，`get_arm_angles` 与 `get_raw_joint_angles` 等价；
-    - 夹爪为 TG-9801 触觉夹爪（自适应模式二值动作 grip/release，
-      开度读数 0-1 由行程端点归一化得到）。
+    - 末端二选一（config `jaka_end_effector`）：TG-9801 触觉夹爪（自适应模式
+      二值动作 grip/release，开度 0-1 由行程端点归一化）或灵心巧手 O6 手
+      （二值动作 grip/open，开度 0-1 由无名指角度 0~255 归一化）。两者都只
+      暴露流水线的标量开度 `gripper_open_0to1`，切换对上层透明。
     """
 
     JOINT_COUNT = 6
@@ -53,6 +56,13 @@ class JakaBySDK(Arm):
     GRIPPER_SPEED = 1100
     # TG-9801 默认夹持力（有效范围 0~100）
     GRIPPER_FORCE = 50
+    # O6 手开度读数用的代表指：无名指（驱动 read_angle 的下标，reg4）。
+    # 2026-10-14 两轮实测（空握→[0,0,73,55,0,0]，握方块→[0,0,108,92,93,101]）：
+    # 拇指碰不到掌心方块（两向都闭到 0），食指/中指被全弯的拇指垫住（73 vs
+    # 108 余量太薄），只有无名指/小指既能空握闭到 0、又能被方块挡在 ~93
+    # （0.36 ≫ 阈值），「握空/握住」双向判定都成立。
+    # 单指读约 1.3s、读 6 指约 8s，热路径（get_arm_angles/move_to）取单指作代表。
+    HAND_OPEN_FINGER = 4
     # JAKA Mini 各关节软限位（硬件用户手册 表5-1，单位度）
     JOINT_LIMITS_DEG = (
         (-360.0, 360.0), (-125.0, 125.0), (-130.0, 130.0),
@@ -72,7 +82,8 @@ class JakaBySDK(Arm):
         """初始化 JAKA 机械臂控制器。
 
         Args:
-            debug_mode: 是否使用调试模式；调试模式下超时更长、夹爪力更保守。
+            debug_mode: 是否使用调试模式；调试模式下到位/等待超时更长
+                （末端为夹爪时夹持力也更保守）。
             move_speed: 运动速度百分比，范围 1-100；默认 None 时读取配置项
                 `arm_move_speed`（缺省 100 全速）。值越小机械臂运动越慢、越平稳。
         """
@@ -100,42 +111,60 @@ class JakaBySDK(Arm):
         ret = self.robot.login()
         if ret[0] != 0:
             raise ConnectionError(f"JAKA 控制器登录失败 ({arm_ip}): {ret}")
-        # 夹爪共享同一条控制器连接（控制器 SDK 连接数有限）；
-        # power_on 会给整个机械臂上电并等待夹爪就绪（内部等电流非 0）。
-        self.gripper = JakaGripper(robot=self.robot)
-        self.gripper.power_on()
-        self.robot.enable_robot()
+        # 末端二选一（config `jaka_end_effector`）：两个驱动共享同一条控制器
+        # 连接（控制器 SDK 连接数有限），power_on 会给整个机械臂上电并等待
+        # 末端就绪；只构造配置指定的那个，另一个保持 None。
+        self.gripper = None
+        self.hand = None
+        end_effector = get_config_value("jaka_end_effector")
+        if end_effector == "hand":
+            self.hand = JakaHand(robot=self.robot)
+            self.hand.power_on()
+            self.robot.enable_robot()
+            # 启动时读一次方向核对装的是哪只手（0x27 右手 / 0x28 左手）：
+            # 从站配错或接线不对时这里直接显示「未知」，不用等抓取判定才发现。
+            direction = self.hand.read_direction()
+            side = {82: "右手", 76: "左手"}.get(direction, "未知")
+            print(f"O6 手: 从站 0x{self.hand.slave_id:02X}（{side}）")
+        elif end_effector == "gripper":
+            self.gripper = JakaGripper(robot=self.robot)
+            self.gripper.power_on()
+            self.robot.enable_robot()
 
-        # 夹爪用自适应模式：grip/release 二值动作（06_gripper_control.py
-        # 实测可用的命令），目标夹持力经 target_force 设置。
-        self.gripper.set_target_force(30 if debug_mode else self.GRIPPER_FORCE)
-        # 缓存夹爪行程端点，用于开度 0-1 与夹爪位置（约 0~1000）的换算。
-        # 端点必须互不相等且都在量程 [0, 1000] 内；该对寄存器读数在部分
-        # 启动轮次不可靠（实测出现过 0/0 和 open=3522），异常时回退到
-        # 本机实测行程：close=1000、open=0（即位置 0=张开、1000=闭合）。
-        open_pos = self.gripper.read_open_position()
-        close_pos = self.gripper.read_close_position()
-        endpoints_valid = (
-            open_pos is not None
-            and close_pos is not None
-            and open_pos != close_pos
-            and 0 <= open_pos <= 1000
-            and 0 <= close_pos <= 1000
-        )
-        if not endpoints_valid:
-            # print(
-            #     f"Warning: TG-9801 行程读取异常 (close={close_pos}, "
-            #     f"open={open_pos})，回退本机实测行程 close=1000/open=0"
-            # )
-            self.gripper_open_pos = 0
-            self.gripper_close_pos = 1000
+            # 夹爪用自适应模式：grip/release 二值动作（06_gripper_control.py
+            # 实测可用的命令），目标夹持力经 target_force 设置。
+            self.gripper.set_target_force(30 if debug_mode else self.GRIPPER_FORCE)
+            # 缓存夹爪行程端点，用于开度 0-1 与夹爪位置（约 0~1000）的换算。
+            # 端点必须互不相等且都在量程 [0, 1000] 内；该对寄存器读数在部分
+            # 启动轮次不可靠（实测出现过 0/0 和 open=3522），异常时回退到
+            # 本机实测行程：close=1000、open=0（即位置 0=张开、1000=闭合）。
+            open_pos = self.gripper.read_open_position()
+            close_pos = self.gripper.read_close_position()
+            endpoints_valid = (
+                open_pos is not None
+                and close_pos is not None
+                and open_pos != close_pos
+                and 0 <= open_pos <= 1000
+                and 0 <= close_pos <= 1000
+            )
+            if not endpoints_valid:
+                # print(
+                #     f"Warning: TG-9801 行程读取异常 (close={close_pos}, "
+                #     f"open={open_pos})，回退本机实测行程 close=1000/open=0"
+                # )
+                self.gripper_open_pos = 0
+                self.gripper_close_pos = 1000
+            else:
+                self.gripper_open_pos = open_pos
+                self.gripper_close_pos = close_pos
+            print(
+                f"TG-9801 行程: close={self.gripper_close_pos}, "
+                f"open={self.gripper_open_pos}"
+            )
         else:
-            self.gripper_open_pos = open_pos
-            self.gripper_close_pos = close_pos
-        print(
-            f"TG-9801 行程: close={self.gripper_close_pos}, "
-            f"open={self.gripper_open_pos}"
-        )
+            raise ValueError(
+                f"jaka_end_effector 只支持 hand/gripper，实际 {end_effector!r}"
+            )
 
         self.reset()
 
@@ -179,8 +208,8 @@ class JakaBySDK(Arm):
         if angles_deg is None and desired_gripper_0to1 is None:
             return True
 
-        # TG-9801 自带速度规划，且 RS485 透传不适合 10ms 周期连续写，
-        # 因此夹爪不跟随关节插值逐步下发，直接发一次目标动作。
+        # O6 自带速度规划，且 RS485 透传不适合 10ms 周期连续写，
+        # 因此手不跟随关节插值逐步下发，直接发一次目标动作。
         if desired_gripper_0to1 is not None:
             self._apply_gripper(desired_gripper_0to1)
 
@@ -371,7 +400,7 @@ class JakaBySDK(Arm):
         rpy_rad = R.from_euler("zyx", target_euler, degrees=True).as_euler("xyz")
         pose_mm = [pos[0] * 1000, pos[1] * 1000, pos[2] * 1000, *rpy_rad]
 
-        # 夹爪与 set_arm_angles 同策略：直接发目标动作，不随运动插值
+        # 手与 set_arm_angles 同策略：直接发目标动作，不随运动插值
         if gripper_open_0to1 is not None:
             if not 0 <= gripper_open_0to1 <= 1:
                 raise ValueError("gripper_open_0to1 must in [0, 1]")
@@ -437,7 +466,7 @@ class JakaBySDK(Arm):
             print(f"Error during reset: {e}")
         time.sleep(0.5)
         self.robot.disable_robot()
-        # 末端 RS485 与夹爪供电依赖机械臂上电，power_off 即一并断掉
+        # 末端 RS485 与手供电依赖机械臂上电，power_off 即一并断掉
         self.robot.power_off()
         self.robot.logout()
         print("Arm disconnected")
@@ -508,67 +537,99 @@ class JakaBySDK(Arm):
                 return flipped
         return None
 
-    def _gripper_pos_0to1(self) -> Union[float, None]:
-        """读取夹爪当前位置并归一化到 [0, 1]（1 为全开）。
+    def _ee_read_raw(self, confirm_zero: bool = False):
+        """读末端开合原始读数：O6 手=无名指角度(0~255)，TG-9801=位置(0~1000)。
 
-        本机夹爪为反向行程（位置 0=张开、1000=闭合），公式对正反
-        两个方向均成立。
+        confirm_zero 只对 O6 有效（0 既可能是真实读数也可能是丢应答，见
+        JakaHand.read_angle）；TG-9801 读失败由其驱动内部重试并返回 None。
         """
-        pos = self.gripper.read_position()
-        if pos is None:
+        if self.hand is not None:
+            return self.hand.read_angle(
+                self.HAND_OPEN_FINGER, confirm_zero=confirm_zero
+            )
+        return self.gripper.read_position()
+
+    def _gripper_pos_0to1(self) -> Union[float, None]:
+        """读取末端开合读数并归一化到 [0, 1]（1 为全开）。
+
+        手（O6）：无名指角度 0=完全弯曲、255=伸直，只读无名指一根（约 1.3s）；
+        读 6 指约 8s，热路径（get_arm_angles/move_to）无法承受。夹爪
+        （TG-9801）：位置 0~1000 反向行程（位置 0=张开、1000=闭合），公式对
+        正反两个方向均成立。手侧 0 既可能是真实读数（握拳到底）也可能是丢
+        应答，而 catch() 的成败判定正依赖该读数，故 confirm_zero 多读一次确认。
+        """
+        raw = self._ee_read_raw(confirm_zero=True)
+        if raw is None:
             return None
-        lo = self.gripper_close_pos
-        hi = self.gripper_open_pos
+        if self.hand is not None:
+            lo, hi = 0, 255  # 无名指角度：0=握拳, 255=张开
+        else:
+            lo, hi = self.gripper_close_pos, self.gripper_open_pos
         if hi == lo:
             return 0.0
-        value = (pos - lo) / (hi - lo)
-        return float(np.clip(value, 0, 1).round(2))
+        return float(np.clip((raw - lo) / (hi - lo), 0, 1).round(2))
 
     def _apply_gripper(self, open_0to1: float) -> None:
-        """驱动夹爪到目标开度。
+        """驱动末端到目标开度，两者都是二值动作：开度 >=0.5 视为张开，否则夹取。
 
-        TG-9801 自适应模式为二值动作：开度 >=0.5 视为张开（release），
-        否则夹取（grip，夹到目标力即停）。这两条命令经
-        06_gripper_control.py 真机验证可用。
+        · O6 手：张开=五指伸直（角度 255），握拳=角度 0（全弯到位或握到障碍
+          即停）；速度/力矩用 JakaHand 的 DEFAULT_SPEED/DEFAULT_TORQUE（probe
+          真机验证值），命令经 tools/jaka_hand_probe.py --wiggle 验证可用。
+        · TG-9801：张开=release，夹取=grip（夹到目标力即停），这两条命令经
+          06_gripper_control.py 真机验证可用。
         """
+        if self.hand is not None:
+            if open_0to1 >= 0.5:
+                self.hand.open()
+            else:
+                self.hand.grip()
+            return
         if open_0to1 >= 0.5:
             self.gripper.release()
         else:
             self.gripper.grip(self.GRIPPER_SPEED)
 
     def wait_gripper_gripped(self) -> None:
-        """轮询 TG-9801 位置直至夹取稳定（位置不再变化）再放行抬升。
+        """轮询末端开合读数直至稳定（不再变化）再放行抬升。
 
         相比固定 sleep 自适应：夹厚物体提前稳定即抬、空夹走满行程也
-        等得了。先等位置开始变化（排除指令生效前的静止读数），再等
+        等得了。先等读数开始变化（排除指令生效前的静止读数），再等
         连续两次变化低于阈值；超时（含读取异常）放行，保持原行为上限。
-        注：单次读约 1.3s（见 JakaGripper._read_reg），按读取节奏采样。
+        注：单次读约 1.3s（见 JakaGripper/JakaHand._read_once），按读取节奏采样。
         """
         timeout_s = 8.0
-        stable_threshold = 5  # 位置计数（行程 0~1000）
-        initial_pos = self.gripper.read_position()
-        last_pos = initial_pos
+        # 稳定阈值按各自量程取：TG-9801 位置 0~1000 取 5（0.5%），
+        # O6 无名指角度 0~255 取 8（约 3%，角度读数的量化噪声更大）
+        if self.hand is not None:
+            stable_threshold, label = 8, "无名指角度"
+        else:
+            stable_threshold, label = 5, "位置"
+        initial_raw = self._ee_read_raw()
+        last_raw = initial_raw
         moved = False
         start = time.time()
         while time.time() - start < timeout_s:
-            pos = self.gripper.read_position()
-            if pos is None:
+            raw = self._ee_read_raw()
+            if raw is None:
                 continue
-            print(f"[wait_gripper] t={time.time() - start:.2f}s pos={pos}")
+            print(f"[wait_gripper] t={time.time() - start:.2f}s {label}={raw}")
             if not moved:
-                if abs(pos - initial_pos) > stable_threshold:
+                if (
+                    initial_raw is not None
+                    and abs(raw - initial_raw) > stable_threshold
+                ):
                     moved = True
-                    last_pos = pos
+                    last_raw = raw
                 continue
-            if abs(pos - last_pos) <= stable_threshold:
-                print(f"[wait_gripper] 位置稳定于 {pos}，放行抬升")
+            if abs(raw - last_raw) <= stable_threshold:
+                print(f"[wait_gripper] {label}稳定于 {raw}，放行抬升")
                 return
-            last_pos = pos
-        print(f"[wait_gripper] 超时({timeout_s}s)放行，末位置 {last_pos}")
+            last_raw = raw
+        print(f"[wait_gripper] 超时({timeout_s}s)放行，末{label}={last_raw}")
 
 
 if __name__ == "__main__":
-    # 最小控制验证：读状态 → 小幅关节运动 → 夹爪闭合/张开 → 复位断开
+    # 最小控制验证：读状态 → 小幅关节运动 → 末端闭合/张开 → 复位断开
     arm: JakaBySDK = Arm(debug_mode=False)  # type:ignore
     time.sleep(1)
     print("关节角度:", arm.get_arm_angles())
@@ -581,13 +642,13 @@ if __name__ == "__main__":
     arm.set_arm_angles([0, 0, 0, 0, 0, 0])
     time.sleep(1)
 
-    # 2) 夹爪：闭合 → 张开（grip/release，06_gripper_control.py 同款命令）
+    # 2) 末端：闭合 → 张开（按 config jaka_end_effector 驱动 O6 手或 TG-9801 夹爪）
     arm.set_gripper(0)
     time.sleep(2)
-    print("夹爪开度(应为0，闭合):", arm.get_arm_angles()[1])
+    print("末端开度(应为0，闭合):", arm.get_arm_angles()[1])
     arm.set_gripper(1)
     time.sleep(2)
-    print("夹爪开度(应为1，张开):", arm.get_arm_angles()[1])
+    print("末端开度(应为1，张开):", arm.get_arm_angles()[1])
 
     # 3) 位姿运动验证：上方 → 下降 → 抬起（含 home 奇异起点的关节路径）
     #    [0.2, 0, ...] 为此前 IK 选到超限支的目标，作为回归测试用例

@@ -69,7 +69,7 @@
 | 设备                          | 说明                                                                                            |
 | ----------------------------- | ----------------------------------------------------------------------------------------------- |
 | Piper 机械臂                  | 通过 USB-CAN 适配器连接，CAN 总线通信                                                           |
-| JAKA Mini 机械臂（可选）      | 以太网连接控制器（`arm_port` 填控制器 IP），SDK 已附带在 `arm/jaka_sdk/`，搭配 TG-9801 触觉夹爪 |
+| JAKA Mini 机械臂（可选）      | 以太网连接控制器（`arm_port` 填控制器 IP），SDK 已附带在 `arm/jaka_sdk/`，末端支持 TG-9801 触觉夹爪 / 灵心巧手 O6 手 |
 | Orbbec 深度相机               | 通过 USB 连接，作为俯视（above）相机，用于目标检测与视觉反馈                                    |
 | Intel RealSense 相机（可选）  | 作为腕部（wrist）相机，用于双视角 VLA 数据采集与推理                                            |
 | USB-CAN 适配器                | 连接机械臂与主机                                                                                |
@@ -231,9 +231,10 @@ pip install -r requirements-jaka.txt
 ```yaml
 arm_type: jaka
 arm_port: 10.5.5.100 # JAKA 控制器 IP
+jaka_end_effector: hand # 末端二选一：hand=灵心巧手 O6 手，gripper=TG-9801 触觉夹爪
 ```
 
-2. 连通性与运动验证（读状态 → 小幅关节运动 → 夹爪开合 → 复位断开），激活 venv 后在项目根目录运行：
+2. 连通性与运动验证（读状态 → 小幅关节运动 → 末端开合 → 复位断开），激活 venv 后在项目根目录运行：
 
 ```bash
 python arm/jaka_ctrl_by_sdk.py
@@ -245,16 +246,26 @@ python arm/jaka_ctrl_by_sdk.py
 | ------------------------------ | ------------------------------------------------------------------------ |
 | `tools/jaka_estop_recover.py`  | 急停释放后复位：清错误 → 上电 → 使能 → 人工确认后慢速回 Home             |
 | `tools/jaka_pick_place_pos.py` | 拖动机械臂采样放置点，输出可直接粘贴进 `config.yaml` 的 `place_pos` 片段 |
-| `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约）                     |
+| `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约；需 `jaka_end_effector: gripper`） |
 | `tools/jaka_gripper_diagnose.py` | TG-9801 读链路诊断（通道配置 → 逐寄存器读 → 物理跟踪验证）             |
 | `tools/jaka_hand_probe.py`     | 灵心巧手 O6 手探测与动作验证（读探测 / `--sweep` 扫波特率 / `--wiggle` 写动作+读回闭环） |
+| `tools/jaka_hand_test.py`      | O6 手功能验证（开合、夹取成败判定、数据契约；需 `jaka_end_effector: hand`） |
 
-> **TG-9801 夹爪读接口注意**：控制器信号量表在「表里 ≥2 条」时槽位会错位
-> （读数张冠李戴/恒 0），驱动已改为「单条目 + `update_tio_rs_signal` 强制轮询」
-> 逐寄存器读，**单次约 1.3s**：`get_arm_angles()` 每次含一次夹爪位置读，
-> 高频循环（策略推理、数据录制）需注意节奏；发 `grip`/`release` 等写指令时
+> **末端读接口注意（TG-9801 / O6 通用）**：控制器信号量表在「表里 ≥2 条」时
+> 槽位会错位（读数张冠李戴/恒 0），两个驱动都改为「单条目 +
+> `update_tio_rs_signal` 强制轮询」逐寄存器读，**单次约 1.3s**：
+> `get_arm_angles()` 每次含一次末端读数（夹爪=位置，手=无名指角度），高频循环
+> （策略推理、数据录制）需注意节奏；发 `grip`/`release`/`open` 等写指令时
 > **勿并发轮询**，否则轮询流量会抢 RS485 半双工总线导致写帧丢失。
-> 读链路异常时运行 `python tools/jaka_gripper_diagnose.py` 诊断。
+> O6 另有约 5~15% 概率丢应答（表里回落为 0，与真实 0 无法区分），驱动对
+> 抓取成败判定用的读数做了 0 值重读确认；开合动作指令后约 2~5s 内读数也
+> 可能为假 0（执行动作期间应答迟滞，过窗自愈），判定类读数须在动作稳定后
+> 进行（`catch()` 的 wait 轮询节奏已天然规避）；抓取成败判定读**无名指角度**——
+> 拇指碰不到掌心方块、食指/中指被全弯的拇指垫住，只有无名指/小指空握时
+> 闭到 0、握物时被挡在 ~93/255，双向判定都成立；接线时手的 A/B 极性与直觉
+> 相反（详见 `tools/jaka_hand_probe.py` 头注释）。
+> 读链路异常时运行 `python tools/jaka_gripper_diagnose.py`（夹爪）或
+> `python tools/jaka_hand_probe.py`（手）诊断。
 
 ---
 
@@ -783,7 +794,7 @@ sudo ip link set "$CAN_IF" up
 ```
 roboarm/
   arm/              # 机械臂控制（Piper / Lerobo / JAKA），手眼标定；jaka_sdk/ 为 JAKA 官方 SDK
-  tools/            # 独立工具脚本（JAKA 急停恢复、放置点采样、夹爪验证）
+  tools/            # 独立工具脚本（JAKA 急停恢复、放置点采样、夹爪/手验证）
   camera/           # Orbbec 深度相机 + USB 相机控制
   classification/   # YOLO 自动抓取 + 数据采集流水线 + VLA 推理客户端(main.py)
   object_detect/    # YOLO OBB 模型训练与检测

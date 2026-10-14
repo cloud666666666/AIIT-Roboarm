@@ -23,6 +23,11 @@ arm_reach_mse_threshold_deg2: 1.0
 # 对 rot_rad 加上该偏移补偿；实机方向不对时改为 -90，默认无偏移可置 0。
 jaka_catch_rot_offset_deg: 90
 
+# JAKA 末端二选一：hand=灵心巧手 O6 手，gripper=TG-9801 触觉夹爪，仅 arm_type=jaka
+# 时读取。必须与末端实际安装一致：选错时启动会打印末端「未就绪」（读不到手/
+# 夹爪应答），之后读回与动作下发均无效。两者共用末端 RS485L 通道，接线不同。
+jaka_end_effector: hand
+
 # 不用远程摄像头则置空
 camera_ip:
 camera_port: 8084
@@ -99,6 +104,7 @@ classification_YOLO_model_path:
 default_conf_thres: 0.5
 
 # 夹爪闭合阈值，小于该值认为夹取失败，范围是[0,1]，越大越开，1表示完全张开（不是角度）
+# （O6 手末端下该阈值×255 = 无名指角度，如 0.05 ≈ 角度 13；无名指挡不住的物体视为抓空）
 default_gripper_close_threshold: 0.05
 
 # 各类别放置位置，(x,y)，单位米
