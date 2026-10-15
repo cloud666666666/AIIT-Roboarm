@@ -4,7 +4,8 @@
 #       → O6 手（右 0x27 / 左 0x28，出厂预期 115200 8N1）。
 #
 # 读：信号量「单条目 + update_tio_rs_signal 强制轮询」——TG-9801 时期实测本控制器
-#     信号量表在表里 ≥2 条时槽位会错位，唯一可靠读法（约 1.3s/寄存器）。
+#     信号量表在表里 ≥2 条时槽位会错位，唯一可靠读法（约 0.38s/寄存器，
+#     2026-10-15 提速后；时序可用 --timing 复测）。
 # 写：send_tio_rs_command 透传 Modbus RTU 帧（Raw RS485 模式盲发；
 #     返回码 0 仅表示「帧已从控制器发出」，不代表手有应答）。
 #
@@ -21,6 +22,7 @@
 #   python tools/jaka_hand_probe.py            # 读探测（不动手指）
 #   python tools/jaka_hand_probe.py --sweep    # 读探测不到时扫 JAKA 支持的波特率×两个从站
 #   python tools/jaka_hand_probe.py --wiggle   # 读后写「握拳→张开」并经读回确认（会动手指，有确认提示）
+#   python tools/jaka_hand_probe.py --timing   # 读时序实测：扫描 WAIT_ADD/WAIT_UPDATE 参数组合的成功率与耗时
 #   python tools/jaka_hand_probe.py --slave 0x27 --baud 115200   # 指定从站/波特率
 import argparse
 import os
@@ -33,6 +35,8 @@ import arm.jaka_sdk  # noqa: F401  按平台注入 jkrc SDK 路径并预加载�
 
 import jkrc
 from utils.config_getter import get_config_value
+
+from arm.jaka_hand import JakaHand
 
 CHN = 1               # 末端 RS485L = 通道 1（原 TG-9801 同一路）
 DEFAULT_BAUD = 115200
@@ -119,7 +123,7 @@ def probe_slave(robot, slave: int) -> bool:
         return False
     print(f"    核心寄存器: " + ", ".join(
         f"{name}(reg{addr})={vals[addr]}" for addr, name in PROBE_REGS.items()))
-    print("    完整读（逐个读，约 1.3s/个）:")
+    print("    完整读（逐个读，约 0.38s/个）:")
     angles = [read_reg(robot, i) for i in range(6)]
     print(f"      角度(0~5, 0=弯曲/255=伸直): {angles}")
     for addr in (30, 31, 35, 39, 40, 41):
@@ -164,6 +168,47 @@ def wiggle(robot, slave: int, baud: int) -> None:
     print("    （写返回码 0 只代表帧已发出——以上角度读回为准）")
 
 
+def w_regs(robot, slave: int, addr: int, values) -> int:
+    """Raw 透传写一帧 Modbus 10 功能码（与 JakaHand._write_regs 一致）。"""
+    config_channel(robot, slave, DEFAULT_BAUD, mode=RAW_MODE)
+    data = b"".join(int(v).to_bytes(2, "big") for v in values)
+    p = (bytes([slave, 0x10]) + addr.to_bytes(2, "big")
+         + len(values).to_bytes(2, "big") + bytes([len(data)]) + data)
+    return robot.send_tio_rs_command(CHN, bytearray(p + crc16_modbus(p)))[0]
+
+
+# 读时序实测的参数组合 (WAIT_ADD, WAIT_UPDATE)：现存默认 (0.5,0.6) + 逐级压缩。
+# 读值在 update 后约 0.01s 就进表（JakaHand 头注释实测），等待有大量水分。
+TIMING_COMBOS = [(0.5, 0.6), (0.2, 0.2), (0.15, 0.1), (0.1, 0.05), (0.05, 0.02)]
+TIMING_READS = 12  # 每组轮数（每组约 12 × 2×wait + 0.3s 开销 ≈ 5s）
+
+
+def timing_scan(robot, slave: int, baud: int) -> None:
+    """扫描读时序参数（WAIT_ADD/WAIT_UPDATE）的成功率与单次耗时，找安全提速点。
+
+    只读自由度(reg30，不可能为 0，0 即丢应答判失败)，不动手指；每轮 = 一次
+    单条目读（add→wait→update→wait→get→del）。注意成功率含手本身的 5~15%
+    丢应答率（成簇出现），组间对比看相对差异；每 12 轮内至少成功 11 轮视作
+    该组可用（失败会走驱动重试，代价只是个别轮次变慢）。
+    """
+    config_channel(robot, slave, baud, mode=0)
+    print(f"  （成功率含手自身的丢应答率；对比组间差异找可用组合）")
+    for add_s, upd_s in TIMING_COMBOS:
+        # 与 JakaHand 完全相同的单条目读路径，仅覆盖等待参数
+        hand = JakaHand(ip="", robot=robot, chn=CHN, slave_id=slave, baudrate=baud)
+        hand._READ_WAIT_ADD, hand._READ_WAIT_UPDATE = add_s, upd_s
+        ok_n, t0 = 0, time.time()
+        for _ in range(TIMING_READS):
+            if hand._read_reg(30, attempts=1, zero_is_invalid=True) == 6:
+                ok_n += 1
+        dt = (time.time() - t0) / TIMING_READS
+        verdict = "✓ 可用" if ok_n >= TIMING_READS - 1 else "✗ 不可靠"
+        print(f"    WAIT_ADD={add_s:<4} WAIT_UPDATE={upd_s:<4} "
+              f"成功率 {ok_n}/{TIMING_READS}  平均 {dt:.2f}s/次  {verdict}")
+    print("    注：通过后把可用组合写回 arm/jaka_hand.py _READ_WAIT_ADD/_WAIT_UPDATE"
+          "（驱动/工具/测试共用，读速即全局提升）")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="O6 经 JAKA 末端 RS485L 探测")
     parser.add_argument("--slave", type=lambda x: int(x, 0), default=None,
@@ -172,6 +217,8 @@ def main() -> int:
     parser.add_argument("--sweep", action="store_true",
                         help="读不到时扫 JAKA 支持的全部波特率")
     parser.add_argument("--wiggle", action="store_true", help="盲写开合动作（会动手指）")
+    parser.add_argument("--timing", action="store_true",
+                        help="读时序实测：扫描等待参数的成功率与耗时（不动手指）")
     args = parser.parse_args()
 
     slaves = [args.slave] if args.slave is not None else SLAVES
@@ -223,6 +270,12 @@ def main() -> int:
         for slave, baud in (results or [(slaves[0], args.baud)]):
             print(f"  从站 0x{slave:02X} @ {baud}:")
             wiggle(robot, slave, baud)
+
+    if args.timing:
+        print("\n[4] 读时序实测（只读自由度，不动手指）")
+        for slave, baud in (results or [(slaves[0], args.baud)]):
+            print(f"  从站 0x{slave:02X} @ {baud}:")
+            timing_scan(robot, slave, baud)
 
     robot.logout()
     return 0 if ok else 1

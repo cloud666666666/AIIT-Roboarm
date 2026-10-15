@@ -14,29 +14,33 @@ O6 寄存器（官方 linkerhand-python-sdk 一致）：
 
 读策略：控制器信号量表在「表里 ≥2 条」时槽位会错位（2026-10-08 实测于 TG-9801，
 见 arm/jaka_gripper.py 头注释），唯一可靠读法是「表里只放 1 条 +
-update_tio_rs_signal 强制轮询」，单次约 1.3s。O6 经本链路读另有约 5~15% 概率
+update_tio_rs_signal 强制轮询」，单次约 0.38s（2026-10-15 提速：等待参数从
+0.5/0.6 压到 0.1/0.05，见 _READ_WAIT_ADD 注释；SDK 表条目只支持单地址、
+无盲读透传接口，逐寄存器读无法再减轮数）。O6 经本链路读另有约 5~15% 概率
 丢应答（2026-10-14 实测），丢应答时表里回落到初值 0——角度 0（完全弯曲）是
 合法值，与丢应答无法从单次读数区分：
   · 不可能为 0 的寄存器（自由度/型号/方向）按 zero_is_invalid 判失败并重读；
   · 角度这类 0 为合法值的寄存器用 read_angle(confirm_zero=True) 对 0 多读一次
-    确认（确认真实 0 的代价是多花约 1.3s）。
+    确认（确认真实 0 的代价是多花约 0.4s）。
 读后即删条目：多条目表会错位，且轮询流量会与写指令抢 RS485 半双工总线导致写丢帧。
 读数为 0 有两种成因，处置不同（2026-10-14 实测）：
   · 静止时的丢应答：成簇出现（连读可出现十几秒的全 0），长等待不能解决——
     值在 update 后约 0.01s 就进表，丢应答是「手没应答」而非「等得不够」；
-  · 动作后约 2~5s 的应答迟滞：手在执行开合动作期间应答变慢/丢失，0.6s 的
-    表内等待收不到值，表里回落为初值 0。例：握住方块时 grip 后轮询头 3 次
-    读 0（手指被方块挡在 ~98，物理上到不了 0）；open 后 ~4.6s 内读 0 而
-    数秒后读到真实 254。这类假 0 过窗后自然消失，判定类读数须在动作稳定后
-    进行（wait_gripper_gripped 的轮询节奏天然规避，catch 判定在其后）。
+  · 动作后约 2~5s 的应答迟滞：手在执行开合动作期间应答变慢/丢失，表内等待
+    （无论 0.05s 还是 0.6s）都收不到值，表里回落为初值 0。例：握住方块时
+    grip 后轮询头 3 次读 0（手指被方块挡在 ~98，物理上到不了 0）；open 后
+    ~4.6s 内读 0 而数秒后读到真实 254。这类假 0 过窗后自然消失，判定类读数
+    须在动作稳定后进行（wait_gripper_gripped 的轮询节奏天然规避，catch 判定
+    在其后）。
 
 写策略：Modbus 主站模式下透传（tools/jaka_hand_probe.py 的 Raw 路径等价）。
 返回码 0 仅表示「帧已从控制器发出」，不代表手有应答；物理动作以读回为准。
 每次动作必须按「速度 → 力矩 → 目标角度」三帧一起写：手在动作结束后会把速度
 寄存器清 0（2026-10-14 实测），只写角度时手指会慢慢挪/停在半路。三帧还不能
-零间隔连发：紧接握拳（堵转握持）后的 open 三连发实测手指完全不动（2026-10-14
-实测，堵转时手的应答变慢，连发帧与应答在半双工总线上相撞即丢），_set_motion
-按 probe 验证过的节奏在帧间留 0.1/0.5s。读回闭环验证见 tools/jaka_hand_test.py。
+零间隔连发：紧接在负载堵转（如握持捏取）后的 open 三连发实测手指完全不动
+（2026-10-14 实测，堵转时手的应答变慢，连发帧与应答在半双工总线上相撞即丢），
+_set_motion 按 probe 验证过的节奏在帧间留 0.1/0.5s。读回闭环验证见
+tools/jaka_hand_test.py 与 tools/jaka_hand_probe.py --grasp（捏取姿势）。
 
 接线（2026-10-14 实测）：手的 A/B 接末端 RS485L 的棕/白一对，极性与直觉相反
 （按 A→棕、B→白 接全无应答，对调即通）；参数用厂商默认 115200 8N1、
@@ -87,9 +91,14 @@ MODE_MODBUS = 0     # Modbus RTU 主站（读写共用；Raw 透传模式本驱�
 
 class JakaHand:
     # 单条目读的等待时间：注册后等控制器写入表、update 触发轮询后等应答写回。
-    # 实测 (0.4,0.5) 12 次中 1 次失败、(0.6,0.6) 12/12 成功，取保守值。
-    _READ_WAIT_ADD = 0.5
-    _READ_WAIT_UPDATE = 0.6
+    # 2026-10-15 真机实测（tools/jaka_hand_probe.py --timing，每组 12 次读自由度）：
+    # 压到 (0.05,0.02)=70ms 仍 12/12 成功——手应答本身很快（~0.1s），等待里
+    # 全是余量，(0.6,0.6) 时代的 (0.4,0.5) 失败记录多半是手 5~15% 成簇丢应答
+    # 撞上了小样本。取 (0.1,0.05)：单次读 1.34s→0.38s、六指 8s→2.3s，等待上
+    # 仍留 5 倍余量（防 Jetson 调度抖动），实测极值 0.30s 只需把两值改回
+    # TIMING_COMBOS 末行。时序余量经 --timing 一键复测。
+    _READ_WAIT_ADD = 0.1
+    _READ_WAIT_UPDATE = 0.05
     # 单次读失败（表里无条目/零值判失败）时的重读次数，含首次共 3 次
     _READ_ATTEMPTS = 3
 
@@ -143,8 +152,8 @@ class JakaHand:
         self._clear_signals()
         # 等手就绪：读自由度(reg30)应为 6。角度 0（握到底）也是合法值，不能作
         # 就绪判据。本次上电会给手断电重启，实测重启后头几次读全失败、约
-        # 10~20s 后才应答，所以外层循环给足 15 次（单次读约 1.3s）。
-        for _ in range(15):
+        # 10~20s 后才应答，所以外层循环给足 60 次（单次读约 0.3s，合 ~18s）。
+        for _ in range(60):
             if self._read_reg(REG_DOF, attempts=1, zero_is_invalid=True):
                 return
         print("Warning: 手未就绪（自由度一直读不到 6），"
@@ -204,7 +213,7 @@ class JakaHand:
         return None
 
     def _read_series(self, reg: int, count: int = FINGER_COUNT) -> list:
-        """逐个读连续 count 个寄存器（约 1.3s/个），失败位置为 None。"""
+        """逐个读连续 count 个寄存器（约 0.38s/个），失败位置为 None。"""
         return [self._read_reg(reg + i) for i in range(count)]
 
     def read_angle(self, finger: int, confirm_zero: bool = False):
@@ -212,7 +221,7 @@ class JakaHand:
 
         丢应答与真实的 0 无法从单次读数区分；confirm_zero=True 时对 0 再读一次
         确认（confirm_zero 时也要防丢应答，读到非 0 以第二次为准），用于抓取
-        成败判定这类 0 会误导判断的地方（代价：真实 0 多花约 1.3s）。
+        成败判定这类 0 会误导判断的地方（代价：真实 0 多花约 0.4s）。
         """
         if not 0 <= finger < FINGER_COUNT:
             raise ValueError(f"finger 需在 0~{FINGER_COUNT - 1}，实际 {finger}")
@@ -225,7 +234,7 @@ class JakaHand:
         return value
 
     def read_angles(self) -> list:
-        """读 6 指当前角度（逐个读，约 1.3s/指），失败位置为 None。"""
+        """读 6 指当前角度（逐个读，约 0.38s/指，全程约 2.3s），失败位置为 None。"""
         return self._read_series(REG_ANGLE)
 
     def read_torques(self) -> list:
@@ -292,12 +301,13 @@ class JakaHand:
         """写 6 指速度（0~255）。"""
         return self._write_regs(REG_SPEED, self._check_values(speeds, "速度"))
 
-    def _set_motion(self, angle: int, speed=None, torque=None) -> int:
+    def _set_motion(self, angles, speed=None, torque=None) -> int:
         """按「速度 →0.1s→ 力矩 →0.5s→ 目标角度」三帧写入（probe 验证节奏）。
 
         三帧零间隔连发会丢帧（2026-10-14 实测：握拳堵转后的 open 三连发
         手指完全不动）；写前静置 0.3s，防上一次读的轮询流量残留抢总线。
         """
+        angles = self._check_values(angles, "角度")
         speed = self.DEFAULT_SPEED if speed is None else speed
         torque = self.DEFAULT_TORQUE if torque is None else torque
         time.sleep(0.3)
@@ -305,7 +315,7 @@ class JakaHand:
         time.sleep(0.1)
         ret_torque = self.set_torque([torque] * FINGER_COUNT)
         time.sleep(0.5)
-        ret_angle = self.set_angles([angle] * FINGER_COUNT)
+        ret_angle = self.set_angles(angles)
         for name, frame_ret in (
             ("速度", ret_speed),
             ("力矩", ret_torque),
@@ -316,12 +326,21 @@ class JakaHand:
         return ret_angle
 
     def open(self, speed=None, torque=None) -> int:
-        """张开（五指伸直，角度 255）。"""
-        return self._set_motion(OPEN_ANGLE, speed, torque)
+        """张开：拇指对掌 + 其余四指伸直（OPEN_ANGLES）。"""
+        return self._set_motion(OPEN_ANGLES, speed, torque)
 
     def grip(self, speed=None, torque=None) -> int:
-        """握拳（角度 0：全弯到位或握到障碍即停，可用于夹取）。"""
-        return self._set_motion(CLOSE_ANGLE, speed, torque)
+        """捏取：五指全闭合（握），拇指保持对掌位（GRASP_ANGLES）。
+
+        手指被物体挡住即停（位置控制，可用于夹取）；夹持力随目标角度与实际
+        角度之差增大，经 DEFAULT_TORQUE 调节。
+        """
+        return self._set_motion(GRASP_ANGLES, speed, torque)
+
+    def set_pose(self, angles, speed=None, torque=None) -> int:
+        """写任意 6 指姿势（0=完全弯曲 ~ 255=伸直），与 open/grip 同一条三帧
+        写入路径（速度 → 力矩 → 目标角度）；供标定/调试（如手动开合工具）用。"""
+        return self._set_motion(angles, speed, torque)
 
     # ---------- 诊断 ----------
     def diagnose(self) -> bool:
@@ -347,8 +366,8 @@ class JakaHand:
         print(f"    set_rs485_chn_comm(...)    -> {r3}")
         print(f"    get_rs485_chn_mode({self.chn})     -> {r4}  (0=Modbus RTU)")
 
-        # 2. 核心寄存器读（单条目 + update，约 1.3s/个）
-        print("[2] 核心寄存器读（单条目 + update_tio_rs_signal，约 1.3s/个）")
+        # 2. 核心寄存器读（单条目 + update，约 0.38s/个）
+        print("[2] 核心寄存器读（单条目 + update_tio_rs_signal，约 0.38s/个）")
         dof = self.read_dof()
         direction = self.read_direction()
         model = self.read_model()

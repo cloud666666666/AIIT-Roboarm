@@ -248,22 +248,39 @@ python arm/jaka_ctrl_by_sdk.py
 | `tools/jaka_pick_place_pos.py` | 拖动机械臂采样放置点，输出可直接粘贴进 `config.yaml` 的 `place_pos` 片段 |
 | `tools/jaka_gripper_test.py`   | TG-9801 夹爪功能验证（开合、夹取成败判定、数据契约；需 `jaka_end_effector: gripper`） |
 | `tools/jaka_gripper_diagnose.py` | TG-9801 读链路诊断（通道配置 → 逐寄存器读 → 物理跟踪验证）             |
-| `tools/jaka_hand_probe.py`     | 灵心巧手 O6 手探测与动作验证（读探测 / `--sweep` 扫波特率 / `--wiggle` 写动作+读回闭环） |
+| `tools/jaka_hand_probe.py`     | 灵心巧手 O6 手探测与动作验证（读探测 / `--sweep` 扫波特率 / `--wiggle` 写动作+读回闭环 / `--grasp` 五指全闭姿势扫描与判定阈值标定 / `--timing` 读时序实测提速） |
+| `tools/jaka_hand_manual.py`    | O6 手手动开合工具（空格=捏合、回车=张开、`e` 现场改闭合角度、`q` 退出，逐指滚动显示读数，供人工判定合适的闭合角度/姿势） |
 | `tools/jaka_hand_test.py`      | O6 手功能验证（开合、夹取成败判定、数据契约；需 `jaka_end_effector: hand`） |
 
 > **末端读接口注意（TG-9801 / O6 通用）**：控制器信号量表在「表里 ≥2 条」时
 > 槽位会错位（读数张冠李戴/恒 0），两个驱动都改为「单条目 +
-> `update_tio_rs_signal` 强制轮询」逐寄存器读，**单次约 1.3s**：
+> `update_tio_rs_signal` 强制轮询」逐寄存器读（SDK 表条目只支持单地址、且
+> SDK 无盲读透传接口，无法批量读）。耗时：**O6 单次约 0.4s**——2026-10-15
+> 用 `tools/jaka_hand_probe.py --timing` 实测把等待参数从 0.5/0.6 压到
+> 0.1/0.05（压到 0.05/0.02 仍 12/12 成功，只留了 5 倍余量；时序异常时
+> 用 --timing 一键复测）；**TG-9801 单次约 1.3s**（自身等待常量，同源可压）。
 > `get_arm_angles()` 每次含一次末端读数（夹爪=位置，手=无名指角度），高频循环
 > （策略推理、数据录制）需注意节奏；发 `grip`/`release`/`open` 等写指令时
 > **勿并发轮询**，否则轮询流量会抢 RS485 半双工总线导致写帧丢失。
 > O6 另有约 5~15% 概率丢应答（表里回落为 0，与真实 0 无法区分），驱动对
-> 抓取成败判定用的读数做了 0 值重读确认；开合动作指令后约 2~5s 内读数也
-> 可能为假 0（执行动作期间应答迟滞，过窗自愈），判定类读数须在动作稳定后
-> 进行（`catch()` 的 wait 轮询节奏已天然规避）；抓取成败判定读**无名指角度**——
-> 拇指碰不到掌心方块、食指/中指被全弯的拇指垫住，只有无名指/小指空握时
-> 闭到 0、握物时被挡在 ~93/255，双向判定都成立；接线时手的 A/B 极性与直觉
-> 相反（详见 `tools/jaka_hand_probe.py` 头注释）。
+> 抓取成败判定用的读数做了 0 值重读确认；开合动作指令后
+> 约 2~5s 内读数也可能为假 0（执行动作期间应答迟滞，过窗自愈），判定类读数
+> 须在动作稳定后进行（`catch()` 的 wait 轮询节奏已天然规避）；张开姿势为
+> HAND_OPEN（拇指对掌、其余四指伸直），抓取是五指全闭合（握）（`arm/jaka_hand.py`
+> OPEN_ANGLES/GRASP_ANGLES：拇指对掌 + 五指目标角度全 0——合到底
+> 或被物体挡住即停，物理位置由物体尺寸决定；无独立力控，夹持力随目标角度
+> 与实际角度之差增大），抓取成败判定沿用 grasp 流程的物理公式（归一化
+> n=1-raw/255、成功窗 [0.20, 0.60]；本驱动开度 =raw/255=n 的补，同一窗换算
+> 为 **[0.40, 0.80]**）：**拇/食/中/环四指角度均值**归一化开度落入窗内判成功
+> （`jaka_ctrl_by_sdk.HAND_GRASP_FINGERS`/`GRASP_OK_MIN`/`GRASP_OK_MAX`）；
+> `catch()` 是二态判定，阈值取窗下界 `GRASP_OK_MIN`——空握（合到底）判失败、
+> 有物阻挡判成功，上界暂作标定参照（二态无法表达「仍在张开」侧失败）。阈值
+> 标定于旧硬件，姿势改为全闭后**必须本机重标**：自动扫描用
+> `python tools/jaka_hand_probe.py --grasp`（张开 → 空握 → 手动放约 5cm
+> 方块 → 全闭握），用打印的空握/夹物读数把 `GRASP_OK_MIN` 取在两者之间；
+> 逐角度人工调姿势用 `python tools/jaka_hand_manual.py`（空格捏合/回车张开、
+> 实时读数）。标定后用 `tools/jaka_hand_test.py` 核验；接线时手的 A/B 极性
+> 与直觉相反（详见 `tools/jaka_hand_probe.py` 头注释）。
 > 读链路异常时运行 `python tools/jaka_gripper_diagnose.py`（夹爪）或
 > `python tools/jaka_hand_probe.py`（手）诊断。
 
