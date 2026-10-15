@@ -461,9 +461,9 @@ def test_moveto(arm: Arm, homography_matrix, image_point, move_lock: threading.L
 
         target_x, target_y = image_to_robot_xy(homography_matrix, image_point)
         target_z = get_config_value("default_desktop_height")
+        # 不传 gripper_open_0to1：移动时保留手当前开合状态（由空格键控制）
         arm.move_to(
             [float(target_x), float(target_y), target_z],
-            gripper_open_0to1=1,
             rot_rad=0,
         )
 
@@ -472,6 +472,23 @@ def test_handeye_2d(homography_matrix):
     arm = Arm()
     move_lock = threading.Lock()
     last_click: dict[str, tuple[float, float]] = {}
+    gripper_state = {"open_0to1": 1}
+    print("按空格切换末端张开/闭合（仅手部动作，机械臂不动）")
+
+    def toggle_gripper():
+        with move_lock:
+            new_open = 0 if gripper_state["open_0to1"] >= 0.5 else 1
+            _, before = arm.get_arm_angles()
+            ok = arm.set_gripper(new_open)
+            # O6 手动作约 1~2s，两轮读回（约 3s）足够等它停稳再看读数
+            _, after = arm.get_arm_angles()
+            gripper_state["open_0to1"] = new_open
+            label = "张开" if new_open >= 0.5 else "闭合"
+            if before is None or after is None:
+                readback = "开合读数不可用"
+            else:
+                readback = f"读数 {before:.2f} → {after:.2f}"
+            print(f"{'已发送' if ok else '发送失败'}: 末端{label}（{readback}）")
 
     def mouse_callback(event, x, y, flags, param):
         if event == cv2.EVENT_LBUTTONDOWN:
@@ -520,6 +537,8 @@ def test_handeye_2d(homography_matrix):
             key = poll_key(1)
             if key == 27:
                 break
+            if key == ord(" "):
+                threading.Thread(target=toggle_gripper, daemon=True).start()
 
         except KeyboardInterrupt:
             break
