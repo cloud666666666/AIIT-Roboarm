@@ -35,8 +35,9 @@ class JakaBySDK(Arm):
     - 关节绝对编码，无 offset 标定，`get_arm_angles` 与 `get_raw_joint_angles` 等价；
     - 末端二选一（config `jaka_end_effector`）：TG-9801 触觉夹爪（自适应模式
       二值动作 grip/release，开度 0-1 由行程端点归一化）或灵心巧手 O6 手
-      （二值动作 grip/open，开度 0-1 由无名指角度 0~255 归一化）。两者都只
-      暴露流水线的标量开度 `gripper_open_0to1`，切换对上层透明。
+      （五指全闭式二值动作 grip/open，开度 0-1 由拇/食/中/环四指角度均值归一化，
+      判定算法沿用 grasp 流程）。两者都只暴露流水线的标量开度
+      `gripper_open_0to1`，切换对上层透明。
     """
 
     JOINT_COUNT = 6
@@ -56,13 +57,22 @@ class JakaBySDK(Arm):
     GRIPPER_SPEED = 1100
     # TG-9801 默认夹持力（有效范围 0~100）
     GRIPPER_FORCE = 50
-    # O6 手开度读数用的代表指：无名指（驱动 read_angle 的下标，reg4）。
-    # 2026-10-14 两轮实测（空握→[0,0,73,55,0,0]，握方块→[0,0,108,92,93,101]）：
-    # 拇指碰不到掌心方块（两向都闭到 0），食指/中指被全弯的拇指垫住（73 vs
-    # 108 余量太薄），只有无名指/小指既能空握闭到 0、又能被方块挡在 ~93
-    # （0.36 ≫ 阈值），「握空/握住」双向判定都成立。
-    # 单指读约 1.3s、读 6 指约 8s，热路径（get_arm_angles/move_to）取单指作代表。
-    HAND_OPEN_FINGER = 4
+    # O6 手抓取成败判定：取拇/食/中/环四指（跳过小指）当前角度均值归一化到
+    # 0-1 后判区间，公式沿用 grasp 流程的 grasp_controller：归一化 n=1-raw/255
+    # （1=合拢），成功窗 [0.20, 0.60]；本驱动的开度是 raw/255（0=合拢、1=伸直），
+    # 即 n=1-开度，同一物理判据换算为成功窗 [0.40, 0.80]。catch() 是二态判定
+    # （读数 < 阈值即失败），阈值取窗的下界 GRASP_OK_MIN：空握/合到底
+    # （n>0.60 侧）判失败，窗内（有物阻挡）判成功；另一侧失败（n<0.20，仍在
+    # 张开/指令未生效 ⇒ 本驱动 >0.80）当前二态无法表达，catch 会把张开态读数
+    # 判成功（抓取流程里该侧只可能出现在动作失败时，上界暂作标定参照）。
+    # 抓取姿势为五指全闭，无名指也参与持握（2026-10-14 实测：空握合到 0、
+    # 握 5cm 方块时被挡在 93，两种状态天然分离），保留在判定内给成功态加一个
+    # 信号；小指不持物、仅随握拳闭拢，不计入。六指逐读约 2.3s，热路径每轮
+    # 只读这 4 指（约 1.5s）。阈值标定于旧硬件，姿势改为全闭后必须本机重标，
+    # 用 tools/jaka_hand_probe.py --grasp 姿势扫描实测读数核对/调整。
+    HAND_GRASP_FINGERS = (0, 2, 3, 4)
+    GRASP_OK_MIN = 0.40
+    GRASP_OK_MAX = 0.80
     # JAKA Mini 各关节软限位（硬件用户手册 表5-1，单位度）
     JOINT_LIMITS_DEG = (
         (-360.0, 360.0), (-125.0, 125.0), (-130.0, 130.0),
@@ -121,6 +131,11 @@ class JakaBySDK(Arm):
             self.hand = JakaHand(robot=self.robot)
             self.hand.power_on()
             self.robot.enable_robot()
+            # catch() 的成败判定用 base 类的 default_gripper_close_threshold
+            # （config 值 0.05 面向 Piper 二值夹爪：闭合即 <0.05；catch 判据
+            # 是「<_阈值 即失败」）。手取 GRASP_OK_MIN 成功窗下界：空握
+            # （合到底）判失败、窗内（有物阻挡）判成功；手路径不读该 config。
+            self.default_gripper_close_threshold = self.GRASP_OK_MIN
             # 启动时读一次方向核对装的是哪只手（0x27 右手 / 0x28 左手）：
             # 从站配错或接线不对时这里直接显示「未知」，不用等抓取判定才发现。
             direction = self.hand.read_direction()
@@ -537,32 +552,34 @@ class JakaBySDK(Arm):
                 return flipped
         return None
 
-    def _ee_read_raw(self, confirm_zero: bool = False):
-        """读末端开合原始读数：O6 手=无名指角度(0~255)，TG-9801=位置(0~1000)。
-
-        confirm_zero 只对 O6 有效（0 既可能是真实读数也可能是丢应答，见
-        JakaHand.read_angle）；TG-9801 读失败由其驱动内部重试并返回 None。
-        """
+    def _ee_read_raw(self):
+        """读末端开合原始读数：O6 手=四指角度均值(0~255)，TG-9801=位置(0~1000)。"""
         if self.hand is not None:
-            return self.hand.read_angle(
-                self.HAND_OPEN_FINGER, confirm_zero=confirm_zero
-            )
+            angles = self.hand.read_angles()
+            active = [angles[i] for i in self.HAND_GRASP_FINGERS]
+            if not any(v is not None for v in active):
+                return None
+            # 单指丢应答（None）时用其余指均值；单指真实的 0（完全弯曲）
+            # 与丢应答无法区分，但判定用的是四指整体口径，单指 0 会拉低
+            # 均值使其偏向"抓空"，且丢应答成簇出现（见 JakaHand 头注释
+            # 的假 0 窗口），不额外做读 0 的多读确认。
+            values = [v for v in active if v is not None]
+            return int(round(sum(values) / len(values)))
         return self.gripper.read_position()
 
     def _gripper_pos_0to1(self) -> Union[float, None]:
         """读取末端开合读数并归一化到 [0, 1]（1 为全开）。
 
-        手（O6）：无名指角度 0=完全弯曲、255=伸直，只读无名指一根（约 1.3s）；
-        读 6 指约 8s，热路径（get_arm_angles/move_to）无法承受。夹爪
-        （TG-9801）：位置 0~1000 反向行程（位置 0=张开、1000=闭合），公式对
-        正反两个方向均成立。手侧 0 既可能是真实读数（握拳到底）也可能是丢
-        应答，而 catch() 的成败判定正依赖该读数，故 confirm_zero 多读一次确认。
+        手（O6）：拇/食/中/环四指角度(0=完全弯曲 ~ 255=伸直)均值 / 255，
+        一轮约 1.5s；夹爪（TG-9801）：位置 0~1000 反向行程（位置 0=张开、
+        1000=闭合），公式对正反两个方向均成立。该值同时服务 catch() 的
+        成败判定与流水线开度（set_arm_angles/gripper.pos 契约）。
         """
-        raw = self._ee_read_raw(confirm_zero=True)
+        raw = self._ee_read_raw()
         if raw is None:
             return None
         if self.hand is not None:
-            lo, hi = 0, 255  # 无名指角度：0=握拳, 255=张开
+            lo, hi = 0, 255  # 四指均值角度：0=合拢, 255=伸直张开
         else:
             lo, hi = self.gripper_close_pos, self.gripper_open_pos
         if hi == lo:
@@ -572,9 +589,10 @@ class JakaBySDK(Arm):
     def _apply_gripper(self, open_0to1: float) -> None:
         """驱动末端到目标开度，两者都是二值动作：开度 >=0.5 视为张开，否则夹取。
 
-        · O6 手：张开=五指伸直（角度 255），握拳=角度 0（全弯到位或握到障碍
-          即停）；速度/力矩用 JakaHand 的 DEFAULT_SPEED/DEFAULT_TORQUE（probe
-          真机验证值），命令经 tools/jaka_hand_probe.py --wiggle 验证可用。
+        · O6 手：张开=五指伸直（角度 229/255），握（全闭）=五指目标角度 0
+          （合到底或合到障碍即停）；速度/力矩用 JakaHand 的 DEFAULT_SPEED/
+          DEFAULT_TORQUE（probe 真机验证值），命令经 tools/jaka_hand_probe.py
+          --wiggle 验证可用。
         · TG-9801：张开=release，夹取=grip（夹到目标力即停），这两条命令经
           06_gripper_control.py 真机验证可用。
         """
@@ -595,15 +613,16 @@ class JakaBySDK(Arm):
         相比固定 sleep 自适应：夹厚物体提前稳定即抬、空夹走满行程也
         等得了。先等读数开始变化（排除指令生效前的静止读数），再等
         连续两次变化低于阈值；超时（含读取异常）放行，保持原行为上限。
-        注：单次读约 1.3s（见 JakaGripper/JakaHand._read_once），按读取节奏采样。
+        注：单次读夹爪约 1.3s（TG-9801 自身等待常量未提速）、O6 手约 0.4s
+        （见 JakaGripper/JakaHand._read_once）；O6 手一轮 = 四指逐读约 1.5s，
+        超时给足约 15 次采样。
         """
-        timeout_s = 8.0
         # 稳定阈值按各自量程取：TG-9801 位置 0~1000 取 5（0.5%），
-        # O6 无名指角度 0~255 取 8（约 3%，角度读数的量化噪声更大）
+        # O6 取四指均值角度 0~255 的 8（约 3%，角度读数的量化噪声更大）
         if self.hand is not None:
-            stable_threshold, label = 8, "无名指角度"
+            timeout_s, stable_threshold, label = 25.0, 8, "四指均值角度"
         else:
-            stable_threshold, label = 5, "位置"
+            timeout_s, stable_threshold, label = 8.0, 5, "位置"
         initial_raw = self._ee_read_raw()
         last_raw = initial_raw
         moved = False

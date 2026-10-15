@@ -22,6 +22,7 @@
 #   python tools/jaka_hand_probe.py            # 读探测（不动手指）
 #   python tools/jaka_hand_probe.py --sweep    # 读探测不到时扫 JAKA 支持的波特率×两个从站
 #   python tools/jaka_hand_probe.py --wiggle   # 读后写「握拳→张开」并经读回确认（会动手指，有确认提示）
+#   python tools/jaka_hand_probe.py --grasp    # 五指全闭姿势扫描与判定阈值标定（会动手指，需手动放 5cm 方块）
 #   python tools/jaka_hand_probe.py --timing   # 读时序实测：扫描 WAIT_ADD/WAIT_UPDATE 参数组合的成功率与耗时
 #   python tools/jaka_hand_probe.py --slave 0x27 --baud 115200   # 指定从站/波特率
 import argparse
@@ -36,7 +37,7 @@ import arm.jaka_sdk  # noqa: F401  按平台注入 jkrc SDK 路径并预加载�
 import jkrc
 from utils.config_getter import get_config_value
 
-from arm.jaka_hand import JakaHand
+from arm.jaka_hand import GRASP_ANGLES, OPEN_ANGLES, JakaHand
 
 CHN = 1               # 末端 RS485L = 通道 1（原 TG-9801 同一路）
 DEFAULT_BAUD = 115200
@@ -177,6 +178,77 @@ def w_regs(robot, slave: int, addr: int, values) -> int:
     return robot.send_tio_rs_command(CHN, bytearray(p + crc16_modbus(p)))[0]
 
 
+# 判定均值用指组合（与 arm/jaka_ctrl_by_sdk.py HAND_GRASP_FINGERS 一致：拇/食/
+# 中/环，跳过小指），三指组合仅作参照：五指全闭时无名指也持物、在判定内
+# （2026-10-14 实测空握合到 0、握 5cm 方块被挡在 93），两种组合的
+# 分离度由本扫描实测数据核对。
+FINGERS_4 = (0, 2, 3, 4)
+FINGERS_3 = (0, 2, 3)
+POSE_OPEN = "张开"
+POSE_AIR = "空握(全闭·空夹)"
+POSE_BLOCK = "全闭握住(放约5cm方块)"
+
+
+def _pose_summary(values) -> str:
+    """一行汇总某姿势的六指原始角度与两种判定指组合的均值（None 记为 ?）。"""
+    raw = " ".join("?" if v is None else f"{v:3d}" for v in values)
+    means = []
+    for label, fingers in (("四指", FINGERS_4), ("三指", FINGERS_3)):
+        vals = [values[i] for i in fingers]
+        means.append(f"{label}均值={'?' if any(v is None for v in vals) else round(sum(vals) / len(vals))}")
+    return f"[{raw}]  {'  '.join(means)}"
+
+
+def grasp_calibrate(robot, slave: int, baud: int) -> None:
+    """五指全闭姿势扫描：张开 → 空握 → 张开 → 放方块 → 握，打印各姿势读数供标定判定阈值。
+
+    每姿势读 6 指约 2.3s；读回判定参照单指 ±25（与旧 --grasp 一致）；末行打印
+    判定阈值建议——GRASP_OK_MIN 应取「空握均值」与「夹物均值」之间。
+    """
+    input("    确认手指活动范围内无障碍物、人守在旁边后按回车开始...")
+    clear_signals(robot)
+
+    def read_angles():
+        config_channel(robot, slave, baud, mode=0)
+        return [read_reg(robot, i) for i in range(6)]
+
+    def apply_pose(name, target):
+        """按驱动节奏写一姿势并读回（速度/力矩 → 目标角度，帧间留间隔）。"""
+        print(f"    写 {name} (目标 {target}) -> "
+              f"{[w_regs(robot, slave, 12, [200] * 6), w_regs(robot, slave, 6, [200] * 6)]}")
+        time.sleep(0.5)
+        print(f"    目标角度帧 -> {w_regs(robot, slave, 0, target)}")
+        time.sleep(2.0)
+        return read_angles()
+
+    a_open = apply_pose(POSE_OPEN, OPEN_ANGLES)
+    print(f"    {POSE_OPEN}角度 = {_pose_summary(a_open)}   期望≈目标 {OPEN_ANGLES}")
+    a_air = apply_pose(POSE_AIR, GRASP_ANGLES)
+    print(f"    {POSE_AIR}角度 = {_pose_summary(a_air)}   期望各参与指≈0（合到底）")
+    # 空握后手指是闭合状态，放方块前先张开（apply_pose 内已读回确认）
+    a_pre = apply_pose(POSE_OPEN, OPEN_ANGLES)
+    print(f"    放方块前重新{POSE_OPEN}角度 = {_pose_summary(a_pre)}（便于放置）")
+    input("    [放方块] 请把约 5cm 方块垫在拇指与食/中/无名指之间，摆好后按回车继续...")
+    a_block = apply_pose(POSE_BLOCK, GRASP_ANGLES)
+    print(f"    {POSE_BLOCK}角度 = {_pose_summary(a_block)}   期望食/中/无名位>0（被方块挡住）")
+
+    print("    标定参考（原判定指组合=四指）：")
+    if None in a_air or None in a_block:
+        print("      ✗ 有寄存器读失败（丢应答），本姿势数据不完整，重跑 --grasp")
+    else:
+        air4 = round(sum(a_air[i] for i in FINGERS_4) / 4)
+        block4 = round(sum(a_block[i] for i in FINGERS_4) / 4)
+        # 拇指物理上够不到这类方块（2026-10-14 实测夹物时拇指仍合到 0），
+        # 被挡的是食/中/无名指；另打印含拇指的四指均值（与判定口径一致）
+        blocked = all(a_block[i] > 25 for i in FINGERS_3)
+        print(f"      四指均值：空握={air4} 夹物={block4} → /255 后 "
+              f"{(air4 / 255):.2f} vs {(block4 / 255):.2f}；"
+              f"GRASP_OK_MIN（jaka_ctrl_by_sdk）取两者之间")
+        print("      逐指自检（食/中/无名被方块挡停时读数应 >25，拇指够不到"
+              f"方块、≈0 属正常）：{'✓' if blocked else '✗（食/中/无名偏差不足，可能没握到方块）'}")
+    print("    （写返回码 0 只代表帧已发出——以上角度读回为准）")
+
+
 # 读时序实测的参数组合 (WAIT_ADD, WAIT_UPDATE)：现存默认 (0.5,0.6) + 逐级压缩。
 # 读值在 update 后约 0.01s 就进表（JakaHand 头注释实测），等待有大量水分。
 TIMING_COMBOS = [(0.5, 0.6), (0.2, 0.2), (0.15, 0.1), (0.1, 0.05), (0.05, 0.02)]
@@ -217,6 +289,8 @@ def main() -> int:
     parser.add_argument("--sweep", action="store_true",
                         help="读不到时扫 JAKA 支持的全部波特率")
     parser.add_argument("--wiggle", action="store_true", help="盲写开合动作（会动手指）")
+    parser.add_argument("--grasp", action="store_true",
+                        help="五指全闭姿势扫描与判定阈值标定（会动手指，需手动放 5cm 方块）")
     parser.add_argument("--timing", action="store_true",
                         help="读时序实测：扫描等待参数的成功率与耗时（不动手指）")
     args = parser.parse_args()
@@ -270,6 +344,12 @@ def main() -> int:
         for slave, baud in (results or [(slaves[0], args.baud)]):
             print(f"  从站 0x{slave:02X} @ {baud}:")
             wiggle(robot, slave, baud)
+
+    if args.grasp:
+        print("\n[3b] 五指全闭姿势扫描与判定阈值标定")
+        for slave, baud in (results or [(slaves[0], args.baud)]):
+            print(f"  从站 0x{slave:02X} @ {baud}:")
+            grasp_calibrate(robot, slave, baud)
 
     if args.timing:
         print("\n[4] 读时序实测（只读自由度，不动手指）")
