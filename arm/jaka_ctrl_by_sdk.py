@@ -148,7 +148,15 @@ class JakaBySDK(Arm):
 
             # 夹爪用自适应模式：grip/release 二值动作（06_gripper_control.py
             # 实测可用的命令），目标夹持力经 target_force 设置。
-            self.gripper.set_target_force(30 if debug_mode else self.GRIPPER_FORCE)
+            # 力度可由 config `jaka_gripper_force` 覆盖（0~100，越大越紧，越容易
+            # 夹碎薄壳物体）；缺省沿用 GRIPPER_FORCE=50，debug 模式仍不超过 30。
+            force = int(
+                get_config_value(
+                    "jaka_gripper_force", self.GRIPPER_FORCE, raise_if_missing=False
+                )
+            )
+            force = max(0, min(force, 100))
+            self.gripper.set_target_force(min(force, 30) if debug_mode else force)
             # 缓存夹爪行程端点，用于开度 0-1 与夹爪位置（约 0~1000）的换算。
             # 端点必须互不相等且都在量程 [0, 1000] 内；该对寄存器读数在部分
             # 启动轮次不可靠（实测出现过 0/0 和 open=3522），异常时回退到
