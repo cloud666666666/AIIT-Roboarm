@@ -629,9 +629,15 @@ class JakaBySDK(Arm):
         # O6 取四指均值角度 0~255 的 8（约 3%，角度读数的量化噪声更大）
         if self.hand is not None:
             timeout_s, stable_threshold, label = 25.0, 8, "四指均值角度"
+            initial_raw = self._ee_read_raw()
         else:
             timeout_s, stable_threshold, label = 8.0, 5, "位置"
-        initial_raw = self._ee_read_raw()
+            # 夹爪路径不能用「现读一次当基线」：catch() 夹取前一定先把夹爪张开
+            # （move_to 都带 gripper_open_0to1=1），张开端点是已知基线；而单次读
+            # 位置约 1.3s，等这次读返回时夹爪往往已经合到物体上停住了，基线会
+            # 直接等于终值，moved 永远不成立，只能空等满超时（实测抓蛋：全程
+            # 516，白等 8s）。手路径读取快（约 0.4s/轮），保持原逻辑。
+            initial_raw = self.gripper_open_pos
         last_raw = initial_raw
         moved = False
         start = time.time()
